@@ -19,6 +19,25 @@ use rc_pipeline::{PipelineConfig, PlatformMediaProvider};
 use rc_render::Renderer;
 use rc_types::{Error, Result, Timestamp};
 
+#[cfg(any(target_os = "ios", test))]
+mod clipboard;
+#[cfg(any(target_os = "ios", test))]
+mod playback;
+
+#[cfg(target_os = "ios")]
+struct PlaybackProvider;
+
+#[cfg(target_os = "ios")]
+impl rc_audio::AudioBackendProvider for PlaybackProvider {
+    fn create_system_audio_capture(&self) -> std::result::Result<Box<dyn rc_audio::AudioCapture>, String> {
+        Err("controller does not capture local audio".into())
+    }
+
+    fn create_audio_player(&self, rate: u32, channels: u8) -> std::result::Result<Box<dyn rc_audio::AudioPlayer>, String> {
+        Ok(Box::new(playback::AppleAudioPlayer::new(rate, channels)?))
+    }
+}
+
 // ── CoreFoundation 引用计数(手工 FFI,避免额外依赖)──
 
 type CFTypeRef = *const std::ffi::c_void;
@@ -209,6 +228,11 @@ pub extern "C" fn rc_apple_media_init() -> i32 {
         return 1;
     }
     let provider_ok = rc_pipeline::register_platform_provider(Arc::new(AppleMediaProvider));
+    #[cfg(target_os = "ios")]
+    {
+        rc_audio::register_audio_provider(Arc::new(PlaybackProvider));
+        clipboard::register();
+    }
     let hooks_ok = rc_client_core::platform::register_platform_hooks(Arc::new(AppleMediaHooks));
     if provider_ok && hooks_ok {
         1

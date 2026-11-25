@@ -13,6 +13,7 @@ rust-version = "1.75"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
+rc-audio = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.14" }
 rc-session = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.14" }
 rc-input = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.14" }
 rc-capture = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.14" }

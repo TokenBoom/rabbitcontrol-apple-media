@@ -904,12 +904,14 @@ dependencies = [
 name = "rc-media-apple"
 version = "0.1.0"
 dependencies = [
+ "rc-audio",
  "rc-capture",
  "rc-client-core",
  "rc-decode",
  "rc-decode-vt",
  "rc-pipeline",
  "rc-render",
+ "rc-session",
  "rc-types",
  "serde_json",
 ]
