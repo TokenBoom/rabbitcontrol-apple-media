@@ -1,0 +1,24 @@
+[package]
+name = "rc-media-apple"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl Apple 平台媒体库:VideoToolbox 硬件解码 + 帧泵渲染,FFI 暴露给 iOS/macOS 客户端。"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+rc-decode-vt = { path = "../rc-decode-vt" }
+rc-client-core = { path = "../../../rabbitcontrol-core/crates/rc-client-core" }
+rc-pipeline = { path = "../../../rabbitcontrol-core/crates/rc-pipeline" }
+rc-render = { path = "../../../rabbitcontrol-core/crates/rc-render" }
+rc-decode = { path = "../../../rabbitcontrol-core/crates/rc-decode" }
+rc-capture = { path = "../../../rabbitcontrol-core/crates/rc-capture" }
+rc-types = { path = "../../../rabbitcontrol-core/crates/rc-types" }
+serde_json = "1"
+
+[dev-dependencies]
+rc-mobile-ffi = { path = "../../../rabbitcontrol-core/crates/rc-mobile-ffi" }
+serde_json = "1"
