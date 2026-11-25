@@ -309,6 +309,13 @@ mod platform {
                     self.advance_clock(elapsed);
                     Err(Error::Timeout(elapsed))
                 }
+                Err(ffi::DecodeFailure::Callback(_)) if !content_is_idr => {
+                    // P 帧缺参考/损坏导致回调返回 bad-data（如 -12909）时不断死会话：
+                    // 断链并请求下一张 IDR 重建参考链（契约 D4）。
+                    self.gate.break_chain();
+                    self.advance_clock(started.elapsed());
+                    Ok(DecodeOutput::NeedKeyframe)
+                }
                 Err(e) => {
                     self.gate.break_chain();
                     Err(Error::Decoder(e.to_string()))

@@ -18,7 +18,7 @@ RabbitControl 的 Apple 平台(iOS/macOS)媒体库:**VideoToolbox 硬件 H.264 �
 
 ## 本地构建
 
-默认从 GitHub `TokenBoom/rabbitcontrol-core` 拉取 `tag = "v0.1.10"`：
+默认从 GitHub `TokenBoom/rabbitcontrol-core` 拉取 `tag = "v0.1.11"`：
 
 ```sh
 cargo build -p rc-media-apple --target aarch64-apple-ios-sim
