@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 env:
-  CORE_TAG: "v0.1.11"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   build:
@@ -29,10 +29,19 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
-      - name: Clone patched core ($CORE_TAG + iOS cfg 放宽)
+      - name: Setup private-repo access
+        env:
+          CORE_READ_TOKEN: ${{ secrets.CORE_READ_TOKEN }}
         run: |
-          # core 以 git+tag 钉版;rc-capture 的 CVPixelBuffer 变体在 macos-only cfg 后,
+          # rabbitcontrol-core 为私有仓:clone 与 cargo 的 git+tag 依赖拉取都需要读权限。
+          git config --global url."https://x-access-token:${CORE_READ_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Clone patched core (iOS cfg 放宽)
+        run: |
+          # core 版本以 Cargo.toml 钉的 tag 为准;rc-capture 的 CVPixelBuffer 变体在 macos-only cfg 后,
           # iOS 编译需要放宽(上游 PR TokenBoom/rabbitcontrol-core#2,未合并前在此打补丁)。
+          CORE_TAG=$(grep -m1 'tag = ' Cargo.toml | sed 's/.*tag = "\(.*\)"/\1/')
+          echo "core tag: $CORE_TAG"
           git clone --depth 1 --branch "$CORE_TAG" \
             https://github.com/TokenBoom/rabbitcontrol-core.git "$RUNNER_TEMP/core"
           cd "$RUNNER_TEMP/core"
@@ -65,5 +74,5 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           if [ "$TAG" = "main" ] || [ -z "$TAG" ]; then TAG="${{ inputs.release_tag }}"; fi
-          gh release create "$TAG" --title "$TAG" --notes "预编译 RabbitControlCore.xcframework(core $CORE_TAG)" 2>/dev/null || true
+          gh release create "$TAG" --title "$TAG" --notes "预编译 RabbitControlCore.xcframework" 2>/dev/null || true
           gh release upload "$TAG" build/RabbitControlCore.xcframework.tar.gz --clobber
