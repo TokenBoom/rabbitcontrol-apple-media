@@ -2,11 +2,17 @@
 //! 运行前先启动:rc-cli host --backend real --listen 0.0.0.0:9901 --approval auto --duration 300s
 use std::ffi::CString;
 
-fn call(f: extern "C" fn(*const std::os::raw::c_char) -> *mut std::os::raw::c_char, json: &str) -> String {
+fn call(
+    f: extern "C" fn(*const std::os::raw::c_char) -> *mut std::os::raw::c_char,
+    json: &str,
+) -> String {
     let cj = CString::new(json).unwrap();
     let ptr = f(cj.as_ptr());
     assert!(!ptr.is_null());
-    let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap().to_string();
+    let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_str()
+        .unwrap()
+        .to_string();
     unsafe { rc_mobile_ffi::rc_string_free(ptr) };
     s
 }
@@ -40,13 +46,19 @@ fn main() {
         }
         let take = rc_media_apple::rc_apple_media_frame_take();
         assert!(!take.is_null());
-        let ts = unsafe { std::ffi::CStr::from_ptr(take) }.to_str().unwrap().to_string();
+        let ts = unsafe { std::ffi::CStr::from_ptr(take) }
+            .to_str()
+            .unwrap()
+            .to_string();
         unsafe { rc_media_apple::rc_apple_media_string_free(take) };
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ts) {
             if let Some(ptr) = v["ptr"].as_u64() {
                 if ptr != 0 {
                     frames += 1;
-                    println!("frame {frames}: {}x{} seq={}", v["width"], v["height"], v["seq"]);
+                    println!(
+                        "frame {frames}: {}x{} seq={}",
+                        v["width"], v["height"], v["seq"]
+                    );
                     unsafe { rc_media_apple::rc_apple_media_frame_release(ptr) };
                 }
             }

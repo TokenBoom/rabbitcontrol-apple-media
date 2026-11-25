@@ -1,0 +1,25 @@
+[package]
+name = "rc-mobile-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl 移动端(iOS/Android)FFI 边界:C ABI 暴露客户端核心能力,JSON 跨边界交换结构化数据。"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+rc-client-core = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+rc-input = { workspace = true }
+rc-session = { workspace = true }
+rc-pipeline = { workspace = true }
+rc-render = { workspace = true }
+rc-decode = { workspace = true }
+rc-capture = { workspace = true }
+rc-types = { workspace = true }
+serde_json = "1"
+
+[dev-dependencies]
+socket2 = { version = "0.6.5", features = ["all"] }
