@@ -350,12 +350,24 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
             let external = rt.external_auth;
             let token_provider: rc_client_core::signal_client::TokenProvider =
                 Arc::new(move || access_token(&auth_for_token, external));
+            let auth_for_refresh = Arc::clone(&rt.auth);
+            let token_refresher: rc_client_core::signal_client::TokenRefresher =
+                Arc::new(move |stale| {
+                    if external {
+                        access_token(&auth_for_refresh, true)
+                    } else {
+                        auth_for_refresh
+                            .refresh_after_unauthorized(stale)
+                            .map_err(|e| format!("{e:?}"))
+                    }
+                });
             let handle = SignalClientHandle::spawn_with_options(
                 cfg.clone(),
                 hostname,
                 req.lan_addrs.clone().unwrap_or_default(),
                 SignalClientOptions {
                     token_provider: Some(token_provider),
+                    token_refresher: Some(token_refresher),
                     device_pubkey: Some(rt.cert_manager.device_pubkey_hex()),
                     allow_remote_assist: false,
                     dynamic_lan_discovery: true,

@@ -43,16 +43,13 @@ fn main() {
     let sig = call(rc_signal_start, r#"{"hostname":"probe-mac","os":"macos"}"#);
     println!("signal_start: {}", &sig[..sig.len().min(200)]);
     std::thread::sleep(std::time::Duration::from_secs(8));
-    let conn = call(
-        rc_runtime_connect,
-        &{
-            let mut j = serde_json::json!({"target_id":"898060465","watch_only":true,"width":1920,"height":1080,"fps":30,"bitrate_bps":4000000,"timeout_sec":25});
-            if let Ok(lan) = std::env::var("PROBE_LAN_DIRECT") {
-                j["lan_direct_addr"] = serde_json::json!(lan);
-            }
-            j.to_string()
-        },
-    );
+    let conn = call(rc_runtime_connect, &{
+        let mut j = serde_json::json!({"target_id":"898060465","watch_only":true,"width":1920,"height":1080,"fps":30,"bitrate_bps":4000000,"timeout_sec":25});
+        if let Ok(lan) = std::env::var("PROBE_LAN_DIRECT") {
+            j["lan_direct_addr"] = serde_json::json!(lan);
+        }
+        j.to_string()
+    });
     println!("connect: {}", &conn[..conn.len().min(300)]);
     println!("signal_status: {}", call(rc_signal_status, "{}"));
     // 有 session_id 则轮询 20s 打印更新

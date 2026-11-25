@@ -163,33 +163,51 @@ impl VtDecoderConfig {
 mod platform {
     use super::{ffi, RefChainGate, VtDecoderConfig, ESTIMATED_DECODE_COST_US};
     use rc_capture::FrameTexture;
-    use rc_decode::{DecodeOutput, DecodedFrame, Decoder};
+    use rc_decode::{DecodeOutput, DecodeSubmitStatus, DecodedFrame, Decoder};
     use rc_encode::Codec;
     use rc_types::{Error, FrameKind, Result, Timestamp};
+    use std::collections::VecDeque;
     use std::fmt;
+    use std::ops::Range;
     use std::time::{Duration, Instant};
 
-    /// VideoToolbox 硬件 H.264 解码器（实现 [`Decoder`](rc_decode::Decoder)）。
+    /// `prepare_frame` 结果：校验与 Annex-B→AVCC/HVCC 准备完成，或需要请求关键帧。
+    enum PrepareOutcome {
+        Ready { content_is_idr: bool },
+        NeedKeyframe,
+    }
+
+    /// VideoToolbox 硬件 H.264/HEVC 解码器（实现 [`Decoder`](rc_decode::Decoder)）。
     ///
     /// - 构造不碰 FFI：会话惰性建立（首个带 SPS/PPS 的 IDR），
     ///   [`VtDecoderConfig::validate`] 的失败在构造期暴露；
     /// - 输出 [`FrameTexture::CVPixelBuffer`] 零拷贝句柄（D1），存活期与
-    ///   采集侧句柄语义对称：**下一次 `decode` / 解码器销毁之前有效**，
+    ///   采集侧句柄语义对称：**下一次 `decode` / `recv_decoded` / 解码器销毁之前有效**，
     ///   渲染器要跨帧持有必须自行 retain；
-    /// - `flush` 恒空操作：进一出一（D5）的实现没有内部缓冲。
+    /// - 支持 2-deep 异步流水线解码（[`Decoder::submit_decode`] / [`Decoder::recv_decoded`]，
+    ///   严格遵守铁律 1 `in_flight ≤ 2`）。
     pub struct VtDecoder {
         cfg: VtDecoderConfig,
         gate: RefChainGate,
-        /// 惰性建立的解码会话；参数集变化时重建。
+        /// 惰性建立的解码会话；参数集变化时先构造新会话成功后再排空替换。
         session: Option<ffi::DecompressionSession>,
+        /// 会话重建期间从旧会话排空保留的已完成输出（FIFO，容量 ≤ 2），附带该帧在旧会话上的
+        /// 参考链健康态 `old_chain_ok`，确保每个已提交 token 均能由 `recv_decoded` 交付，
+        /// 既不与上层失步，也不放行已断链的旧会话 P 帧（D4）。
+        drained_outputs: VecDeque<(ffi::PipelinedDecodeOutput, bool)>,
+        /// 上一帧交付给调用方的输出缓冲保活引用（下一次 `decode` / `recv_decoded` / 销毁前有效）。
+        last_output: Option<ffi::OwnedDecodeOutput>,
         /// 当前会话对应的参数集键（H.264 为 SPS；HEVC 为 VPS||SPS||PPS，检测变化与分辨率切换）。
         session_params: Option<Vec<u8>>,
-        /// 会话内单调帧号（邮箱匹配 + PTS 单调）。
+        /// 会话内单调帧号（邮箱匹配 + PTS 单调；提交前递增永不复用）。
         frame_id: u64,
-        /// 逻辑时钟（微秒，与 `Timestamp` 同为 u32 域）：最近一次实际解码
-        /// 调用的完成时刻。
+        /// 逻辑时钟（微秒，与 `Timestamp` 同为 u32 域）：按非重叠墙钟解码区间推进。
         clock_us: u32,
-        /// 可复用的 AVCC 拼装暂存区：避免每帧重复分配 `Vec<u8>`。
+        /// 上一次推进逻辑时钟的墙钟完成点，用于消除 2-deep 并行重叠双算与渲染等待污染。
+        last_clock_advance: Option<Instant>,
+        /// 可复用的 NAL 范围暂存区（避免每帧分配 `Vec<(u8, &[u8])>`）。
+        nals_scratch: Vec<(u8, Range<usize>)>,
+        /// 可复用的 AVCC/HVCC 拼装暂存区（避免每帧重复分配 `Vec<u8>`）。
         avcc_scratch: Vec<u8>,
     }
 
@@ -216,9 +234,13 @@ mod platform {
                 cfg,
                 gate: RefChainGate::new(),
                 session: None,
+                drained_outputs: VecDeque::with_capacity(ffi::PIPELINED_MAX_IN_FLIGHT),
+                last_output: None,
                 session_params: None,
                 frame_id: 0,
                 clock_us: 0,
+                last_clock_advance: None,
+                nals_scratch: Vec::with_capacity(8),
                 avcc_scratch: Vec::new(),
             })
         }
@@ -228,11 +250,40 @@ mod platform {
             self.frame_id
         }
 
+        /// 当前活跃会话中是否存在尚未回调的 IDR（不计入旧销毁会话的 `drained_outputs`）。
+        fn has_idr_in_flight(&self) -> bool {
+            self.session
+                .as_ref()
+                .is_some_and(ffi::DecompressionSession::has_idr_in_flight)
+        }
+
         /// 推进逻辑时钟（按实测墙钟耗时，饱和到 u32::MAX）并返回完成时刻。
         fn advance_clock(&mut self, elapsed: Duration) -> Timestamp {
             let us = u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX);
             self.clock_us = self.clock_us.saturating_add(us);
             Timestamp(self.clock_us)
+        }
+
+        /// 按非重叠硬件解码区间推进逻辑时钟：在 2-deep 并行重叠或调用方 VSync 阻塞场景下，
+        /// 仅计入 `[max(started, last_clock_advance), completed_at]` 增量，防止双算导致假超时。
+        pub(crate) fn advance_clock_span(
+            &mut self,
+            started: Instant,
+            completed_at: Instant,
+        ) -> Timestamp {
+            let start_bound = match self.last_clock_advance {
+                Some(prev) if prev > started => prev,
+                _ => started,
+            };
+            let delta = completed_at.saturating_duration_since(start_bound);
+            let should_update = match self.last_clock_advance {
+                None => true,
+                Some(prev) => completed_at > prev,
+            };
+            if should_update {
+                self.last_clock_advance = Some(completed_at);
+            }
+            self.advance_clock(delta)
         }
     }
 
@@ -243,45 +294,159 @@ mod platform {
             kind: FrameKind,
             deadline_ts: Timestamp,
         ) -> Result<DecodeOutput> {
-            // 若调用方会话时间戳从高值回绕或被重置，归零逻辑时钟以防假超时。
-            if deadline_ts.0 < self.clock_us
-                && self.clock_us.wrapping_sub(deadline_ts.0) > u32::MAX / 2
-            {
-                self.clock_us = 0;
-            }
-
-            match self.cfg.codec {
-                Codec::H264 => self.decode_h264(data, kind, deadline_ts),
-                Codec::Hevc => self.decode_hevc(data, kind, deadline_ts),
-                other => Err(Error::InvalidConfig(format!(
-                    "rc-decode-vt 不支持解码器 {:?}",
-                    other
-                ))),
+            match self.prepare_frame(data, kind, deadline_ts, false)? {
+                PrepareOutcome::NeedKeyframe => Ok(DecodeOutput::NeedKeyframe),
+                PrepareOutcome::Ready { content_is_idr } => {
+                    self.finish_sync_decode(content_is_idr, deadline_ts)
+                }
             }
         }
 
         fn needs_keyframe(&self) -> bool {
-            // 参考链断裂（含「从未解出过 IDR」）即需要关键帧。
-            !self.gate.is_ok()
+            // 参考链断裂（且无在途 IDR 即将重建链）即需要关键帧。
+            !self.gate.is_ok() && !self.has_idr_in_flight()
         }
 
         fn flush(&mut self) -> Result<()> {
-            // D5：进一出一的实现没有内部缓冲，无帧可冲刷。
+            self.drained_outputs.clear();
+            if let Some(session) = self.session.as_mut() {
+                session.wait_and_clear();
+            }
             Ok(())
+        }
+
+        fn supports_pipelined_decode(&self) -> bool {
+            true
+        }
+
+        fn submit_decode(
+            &mut self,
+            token: u64,
+            data: &[u8],
+            kind: FrameKind,
+            deadline_ts: Timestamp,
+        ) -> Result<DecodeSubmitStatus> {
+            if self.in_flight_count() >= ffi::PIPELINED_MAX_IN_FLIGHT {
+                return Err(Error::Decoder(format!(
+                    "pipelined decode in_flight limit ({}) reached",
+                    ffi::PIPELINED_MAX_IN_FLIGHT
+                )));
+            }
+            match self.prepare_frame(data, kind, deadline_ts, true)? {
+                PrepareOutcome::NeedKeyframe => Ok(DecodeSubmitStatus::NeedKeyframe),
+                PrepareOutcome::Ready { content_is_idr } => {
+                    let Some(session) = self.session.as_mut() else {
+                        return Ok(DecodeSubmitStatus::NeedKeyframe);
+                    };
+                    let submit_id = self
+                        .frame_id
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Decoder("会话帧号耗尽 u64".to_string()))?;
+                    // 提交前即推进 frame_id，即使 VT 返回非零错误也绝不复用 submit_id（防邮箱碰撞）。
+                    self.frame_id = submit_id;
+                    if let Err(e) = session.submit_decode_frame(
+                        &self.avcc_scratch,
+                        submit_id,
+                        token,
+                        content_is_idr,
+                    ) {
+                        // D4：提交失败导致该帧丢失，立即打断参考链并请求关键帧。
+                        self.gate.break_chain();
+                        return Err(Error::Decoder(e.to_string()));
+                    }
+                    Ok(DecodeSubmitStatus::Submitted)
+                }
+            }
+        }
+
+        fn recv_decoded(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<(u64, Result<DecodeOutput>)>> {
+            let (item, drained_chain_ok) =
+                if let Some((drained, old_chain_ok)) = self.drained_outputs.pop_front() {
+                    (drained, Some(old_chain_ok))
+                } else {
+                    let Some(session) = self.session.as_mut() else {
+                        return Ok(None);
+                    };
+                    let Some(item) = session.recv_decoded_frame(timeout) else {
+                        return Ok(None);
+                    };
+                    (item, None)
+                };
+            let from_drained = drained_chain_ok.is_some();
+            let elapsed = item.completed_at.saturating_duration_since(item.started);
+            match item.result {
+                Ok(out) => {
+                    let done_ts = self.advance_clock_span(item.started, item.completed_at);
+                    if let Some(old_chain_ok) = drained_chain_ok {
+                        // 旧会话排空帧不修改新会话门控；若旧会话在该帧处参考链已断（D4），仍丢弃旧 P 帧防花屏。
+                        if !item.content_is_idr && !old_chain_ok {
+                            return Ok(Some((item.token, Ok(DecodeOutput::NeedKeyframe))));
+                        }
+                    } else if item.content_is_idr {
+                        self.gate.mark_idr_decoded();
+                    } else if !self.gate.is_ok() {
+                        // D4：当前会话前序在途帧已打断参考链，丢弃本在途 P 帧防花屏。
+                        return Ok(Some((item.token, Ok(DecodeOutput::NeedKeyframe))));
+                    }
+                    let ptr = out.as_ptr();
+                    let width = out.width;
+                    let height = out.height;
+                    self.last_output = Some(out);
+                    Ok(Some((
+                        item.token,
+                        Ok(DecodeOutput::Frame(DecodedFrame {
+                            texture: FrameTexture::CVPixelBuffer(ptr),
+                            decode_done_ts: done_ts,
+                            width,
+                            height,
+                        })),
+                    )))
+                }
+                Err(ffi::DecodeFailure::Timeout) => {
+                    if !from_drained {
+                        self.gate.break_chain();
+                    }
+                    self.advance_clock_span(item.started, item.completed_at);
+                    Ok(Some((item.token, Err(Error::Timeout(elapsed)))))
+                }
+                Err(ffi::DecodeFailure::Callback(_)) if !item.content_is_idr => {
+                    if !from_drained {
+                        self.gate.break_chain();
+                    }
+                    self.advance_clock_span(item.started, item.completed_at);
+                    Ok(Some((item.token, Ok(DecodeOutput::NeedKeyframe))))
+                }
+                Err(e) => {
+                    if !from_drained {
+                        self.gate.break_chain();
+                    }
+                    Ok(Some((item.token, Err(Error::Decoder(e.to_string())))))
+                }
+            }
+        }
+
+        fn in_flight_count(&self) -> usize {
+            self.drained_outputs.len()
+                + self
+                    .session
+                    .as_ref()
+                    .map_or(0, ffi::DecompressionSession::in_flight_count)
         }
     }
 
     impl VtDecoder {
-        fn finish_decode(
+        fn finish_sync_decode(
             &mut self,
-            kind: FrameKind,
             content_is_idr: bool,
             deadline_ts: Timestamp,
         ) -> Result<DecodeOutput> {
+            self.drained_outputs.clear();
             let Some(session) = self.session.as_mut() else {
                 return Ok(DecodeOutput::NeedKeyframe);
             };
-            let _ = kind;
             let frame_id = self.frame_id;
             self.frame_id = frame_id
                 .checked_add(1)
@@ -292,28 +457,31 @@ mod platform {
             let started = Instant::now();
             match session.decode_frame(&self.avcc_scratch, frame_id, wait) {
                 Ok(out) => {
-                    let done_ts = self.advance_clock(started.elapsed());
+                    let done_ts = self.advance_clock_span(started, Instant::now());
                     if content_is_idr {
                         self.gate.mark_idr_decoded();
                     }
+                    let ptr = out.as_ptr();
+                    let width = out.width;
+                    let height = out.height;
+                    self.last_output = Some(out);
                     Ok(DecodeOutput::Frame(DecodedFrame {
-                        texture: FrameTexture::CVPixelBuffer(out.ptr),
+                        texture: FrameTexture::CVPixelBuffer(ptr),
                         decode_done_ts: done_ts,
-                        width: out.width,
-                        height: out.height,
+                        width,
+                        height,
                     }))
                 }
                 Err(ffi::DecodeFailure::Timeout) => {
                     self.gate.break_chain();
-                    let elapsed = started.elapsed();
-                    self.advance_clock(elapsed);
+                    let now = Instant::now();
+                    let elapsed = now.saturating_duration_since(started);
+                    self.advance_clock_span(started, now);
                     Err(Error::Timeout(elapsed))
                 }
                 Err(ffi::DecodeFailure::Callback(_)) if !content_is_idr => {
-                    // P 帧缺参考/损坏导致回调返回 bad-data（如 -12909）时不断死会话：
-                    // 断链并请求下一张 IDR 重建参考链（契约 D4）。
                     self.gate.break_chain();
-                    self.advance_clock(started.elapsed());
+                    self.advance_clock_span(started, Instant::now());
                     Ok(DecodeOutput::NeedKeyframe)
                 }
                 Err(e) => {
@@ -323,13 +491,66 @@ mod platform {
             }
         }
 
-        fn decode_h264(
+        fn prepare_frame(
             &mut self,
             data: &[u8],
             kind: FrameKind,
             deadline_ts: Timestamp,
-        ) -> Result<DecodeOutput> {
-            let nals = crate::h264::split_nals(data).ok_or_else(|| {
+            pipelined: bool,
+        ) -> Result<PrepareOutcome> {
+            // 若调用方会话时间戳从高值回绕或被重置，归零逻辑时钟以防假超时。
+            if deadline_ts.0 < self.clock_us
+                && self.clock_us.wrapping_sub(deadline_ts.0) > u32::MAX / 2
+            {
+                self.clock_us = 0;
+                self.last_clock_advance = None;
+            }
+            match self.cfg.codec {
+                Codec::H264 => self.prepare_h264(data, kind, deadline_ts, pipelined),
+                Codec::Hevc => self.prepare_hevc(data, kind, deadline_ts, pipelined),
+                other => Err(Error::InvalidConfig(format!(
+                    "rc-decode-vt 不支持解码器 {:?}",
+                    other
+                ))),
+            }
+        }
+
+        fn replace_session(
+            &mut self,
+            new_session: ffi::DecompressionSession,
+            new_params: Vec<u8>,
+            pipelined: bool,
+        ) {
+            if let Some(mut old) = self.session.take() {
+                if pipelined {
+                    let mut old_chain_ok = self.gate.is_ok();
+                    for out in old.drain_all_in_flight() {
+                        match &out.result {
+                            Ok(_) if out.content_is_idr => old_chain_ok = true,
+                            Err(_) => old_chain_ok = false,
+                            Ok(_) => {}
+                        }
+                        self.drained_outputs.push_back((out, old_chain_ok));
+                    }
+                } else {
+                    old.wait_and_clear();
+                    self.drained_outputs.clear();
+                }
+            }
+            // 新会话 DPB 为空，须在其自身解出首张 IDR 后再恢复参考链门控。
+            self.gate.break_chain();
+            self.session = Some(new_session);
+            self.session_params = Some(new_params);
+        }
+
+        fn prepare_h264(
+            &mut self,
+            data: &[u8],
+            kind: FrameKind,
+            deadline_ts: Timestamp,
+            pipelined: bool,
+        ) -> Result<PrepareOutcome> {
+            crate::h264::split_nals_into(data, &mut self.nals_scratch).ok_or_else(|| {
                 Error::InvalidFrame(format!(
                     "rc-decode-vt: 码流不是合法 Annex-B（配置声明 bitstream_format={}）：{} 字节输入",
                     self.cfg.bitstream_format.as_str(),
@@ -337,7 +558,7 @@ mod platform {
                 ))
             })?;
 
-            let content_is_idr = nals.iter().any(|(t, _)| *t == 5);
+            let content_is_idr = self.nals_scratch.iter().any(|(t, _)| *t == 5);
             match (kind, content_is_idr) {
                 (FrameKind::Idr, false) => {
                     return Err(Error::InvalidFrame(
@@ -359,12 +580,13 @@ mod platform {
                 ))));
             }
 
-            if !self.gate.is_ok() && !content_is_idr {
-                return Ok(DecodeOutput::NeedKeyframe);
+            let chain_available = self.gate.is_ok() || (pipelined && self.has_idr_in_flight());
+            if !chain_available && !content_is_idr {
+                return Ok(PrepareOutcome::NeedKeyframe);
             }
 
-            if content_is_idr {
-                let (sps, pps) = crate::h264::parameter_sets(&nals);
+            let pending_rebuild = if content_is_idr {
+                let (sps, pps) = crate::h264::parameter_sets_from_ranges(data, &self.nals_scratch);
                 match (sps, pps) {
                     (Some(sps), Some(pps)) => {
                         let needs_rebuild = match self.session_params.as_deref() {
@@ -383,37 +605,52 @@ mod platform {
                                     )));
                                 }
                             }
-                            self.session = Some(
-                                ffi::DecompressionSession::new(sps, pps).map_err(Error::Decoder)?,
-                            );
-                            self.session_params = Some(sps.to_vec());
+                            Some((sps, pps))
+                        } else {
+                            None
                         }
                     }
-                    _ if self.session.is_none() => return Ok(DecodeOutput::NeedKeyframe),
-                    _ => {}
+                    _ if self.session.is_none() => return Ok(PrepareOutcome::NeedKeyframe),
+                    _ => None,
                 }
+            } else {
+                None
+            };
+
+            if pending_rebuild.is_none() && self.session.is_none() {
+                return Ok(PrepareOutcome::NeedKeyframe);
             }
 
-            if self.session.is_none() {
-                return Ok(DecodeOutput::NeedKeyframe);
-            }
-
-            if crate::h264::nals_to_avcc_into(&nals, &mut self.avcc_scratch).is_none() {
+            // 先完成 Annex-B → AVCC 转换校验，确保全部可能失败步骤都在 replace_session 之前完成。
+            if crate::h264::nals_ranges_to_avcc_into(
+                data,
+                &self.nals_scratch,
+                &mut self.avcc_scratch,
+            )
+            .is_none()
+            {
                 return Err(Error::InvalidFrame(
                     "帧不含任何 slice NAL（无法解码出画面）".to_string(),
                 ));
             }
 
-            self.finish_decode(kind, content_is_idr, deadline_ts)
+            if let Some((sps, pps)) = pending_rebuild {
+                let new_session =
+                    ffi::DecompressionSession::new(sps, pps).map_err(Error::Decoder)?;
+                self.replace_session(new_session, sps.to_vec(), pipelined);
+            }
+
+            Ok(PrepareOutcome::Ready { content_is_idr })
         }
 
-        fn decode_hevc(
+        fn prepare_hevc(
             &mut self,
             data: &[u8],
             kind: FrameKind,
             deadline_ts: Timestamp,
-        ) -> Result<DecodeOutput> {
-            let nals = crate::h265::split_nals(data).ok_or_else(|| {
+            pipelined: bool,
+        ) -> Result<PrepareOutcome> {
+            crate::h265::split_nals_into(data, &mut self.nals_scratch).ok_or_else(|| {
                 Error::InvalidFrame(format!(
                     "rc-decode-vt: HEVC 码流不是合法 Annex-B（配置声明 bitstream_format={}）：{} 字节输入",
                     self.cfg.bitstream_format.as_str(),
@@ -421,7 +658,10 @@ mod platform {
                 ))
             })?;
 
-            let content_is_idr = nals.iter().any(|(t, _)| crate::h265::is_irap_nal(*t));
+            let content_is_idr = self
+                .nals_scratch
+                .iter()
+                .any(|(t, _)| crate::h265::is_irap_nal(*t));
             match (kind, content_is_idr) {
                 (FrameKind::Idr, false) => {
                     return Err(Error::InvalidFrame(
@@ -443,67 +683,81 @@ mod platform {
                 ))));
             }
 
-            if !self.gate.is_ok() && !content_is_idr {
-                return Ok(DecodeOutput::NeedKeyframe);
+            let chain_available = self.gate.is_ok() || (pipelined && self.has_idr_in_flight());
+            if !chain_available && !content_is_idr {
+                return Ok(PrepareOutcome::NeedKeyframe);
             }
 
-            if content_is_idr {
-                let params = crate::h265::parameter_sets(&nals);
+            let pending_rebuild = if content_is_idr {
+                let params = crate::h265::parameter_sets_from_ranges(data, &self.nals_scratch);
                 match (params.vps, params.sps, params.pps) {
                     (Some(vps), Some(sps), Some(pps)) => {
-                        let vps_len = u16::try_from(vps.len()).map_err(|_| {
-                            Error::InvalidFrame("HEVC VPS 长度超过 u16::MAX".to_string())
-                        })?;
-                        let sps_len = u16::try_from(sps.len()).map_err(|_| {
-                            Error::InvalidFrame("HEVC SPS 长度超过 u16::MAX".to_string())
-                        })?;
-                        let pps_len = u16::try_from(pps.len()).map_err(|_| {
-                            Error::InvalidFrame("HEVC PPS 长度超过 u16::MAX".to_string())
-                        })?;
-                        let mut key = Vec::with_capacity(vps.len() + sps.len() + pps.len() + 6);
-                        key.extend_from_slice(&vps_len.to_be_bytes());
-                        key.extend_from_slice(vps);
-                        key.extend_from_slice(&sps_len.to_be_bytes());
-                        key.extend_from_slice(sps);
-                        key.extend_from_slice(&pps_len.to_be_bytes());
-                        key.extend_from_slice(pps);
                         let needs_rebuild = match self.session_params.as_deref() {
-                            Some(cur) => cur != key.as_slice(),
+                            Some(cur) => !crate::h265::params_key_matches(cur, vps, sps, pps),
                             None => true,
                         };
                         if needs_rebuild {
-                            self.session = Some(
-                                ffi::DecompressionSession::new_hevc(
-                                    vps,
-                                    sps,
-                                    pps,
-                                    self.cfg.max_resolution.width,
-                                    self.cfg.max_resolution.height,
-                                )
-                                .map_err(|e| match e {
-                                    Ok(dec_err) => Error::Decoder(dec_err),
-                                    Err(frame_err) => Error::InvalidFrame(frame_err),
-                                })?,
-                            );
-                            self.session_params = Some(key);
+                            let vps_len = u16::try_from(vps.len()).map_err(|_| {
+                                Error::InvalidFrame("HEVC VPS 长度超过 u16::MAX".to_string())
+                            })?;
+                            let sps_len = u16::try_from(sps.len()).map_err(|_| {
+                                Error::InvalidFrame("HEVC SPS 长度超过 u16::MAX".to_string())
+                            })?;
+                            let pps_len = u16::try_from(pps.len()).map_err(|_| {
+                                Error::InvalidFrame("HEVC PPS 长度超过 u16::MAX".to_string())
+                            })?;
+                            Some((vps, sps, pps, vps_len, sps_len, pps_len))
+                        } else {
+                            None
                         }
                     }
-                    _ if self.session.is_none() => return Ok(DecodeOutput::NeedKeyframe),
-                    _ => {}
+                    _ if self.session.is_none() => return Ok(PrepareOutcome::NeedKeyframe),
+                    _ => None,
                 }
+            } else {
+                None
+            };
+
+            if pending_rebuild.is_none() && self.session.is_none() {
+                return Ok(PrepareOutcome::NeedKeyframe);
             }
 
-            if self.session.is_none() {
-                return Ok(DecodeOutput::NeedKeyframe);
-            }
-
-            if crate::h265::nals_to_hvcc_into(&nals, &mut self.avcc_scratch).is_none() {
+            // 先完成 Annex-B → HVCC 转换校验，确保 replace_session 为最终不可逆步骤。
+            if crate::h265::nals_ranges_to_hvcc_into(
+                data,
+                &self.nals_scratch,
+                &mut self.avcc_scratch,
+            )
+            .is_none()
+            {
                 return Err(Error::InvalidFrame(
                     "HEVC 帧不含任何 slice NAL（无法解码出画面）".to_string(),
                 ));
             }
 
-            self.finish_decode(kind, content_is_idr, deadline_ts)
+            if let Some((vps, sps, pps, vps_len, sps_len, pps_len)) = pending_rebuild {
+                let new_session = ffi::DecompressionSession::new_hevc(
+                    vps,
+                    sps,
+                    pps,
+                    self.cfg.max_resolution.width,
+                    self.cfg.max_resolution.height,
+                )
+                .map_err(|e| match e {
+                    Ok(dec_err) => Error::Decoder(dec_err),
+                    Err(frame_err) => Error::InvalidFrame(frame_err),
+                })?;
+                let mut key = Vec::with_capacity(vps.len() + sps.len() + pps.len() + 6);
+                key.extend_from_slice(&vps_len.to_be_bytes());
+                key.extend_from_slice(vps);
+                key.extend_from_slice(&sps_len.to_be_bytes());
+                key.extend_from_slice(sps);
+                key.extend_from_slice(&pps_len.to_be_bytes());
+                key.extend_from_slice(pps);
+                self.replace_session(new_session, key, pipelined);
+            }
+
+            Ok(PrepareOutcome::Ready { content_is_idr })
         }
     }
 }
@@ -701,5 +955,39 @@ mod gates_no_gpu {
                 Timestamp(10_000_000)
             )
             .is_err());
+
+        // 2-deep 流水线解码门禁：支持流水线、未见 IDR 时 submit_decode 返回 NeedKeyframe。
+        assert!(dec.supports_pipelined_decode());
+        assert_eq!(dec.in_flight_count(), 0);
+        assert!(matches!(
+            dec.submit_decode(1, &hevc_p, FrameKind::P, Timestamp(10_000_000)),
+            Ok(rc_decode::DecodeSubmitStatus::NeedKeyframe)
+        ));
+        assert!(matches!(
+            dec.submit_decode(2, &hevc_idr, FrameKind::Idr, Timestamp(10_000_000)),
+            Ok(rc_decode::DecodeSubmitStatus::NeedKeyframe)
+        ));
+        assert_eq!(dec.in_flight_count(), 0);
+        assert!(dec
+            .recv_decoded(std::time::Duration::ZERO)
+            .expect("无在途帧返回 Ok(None)")
+            .is_none());
+    }
+
+    #[test]
+    fn advance_clock_span_does_not_double_count_overlapping_pipelined_frames() {
+        let mut dec = VtDecoder::new(VtDecoderConfig::default()).expect("配置合法");
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_micros(1_500);
+        let t2_start = t0 + std::time::Duration::from_micros(200);
+        let t2_done = t0 + std::time::Duration::from_micros(2_000);
+
+        let ts1 = dec.advance_clock_span(t0, t1);
+        let ts2 = dec.advance_clock_span(t2_start, t2_done);
+        assert_eq!(ts1.0, 1_500, "首帧应计入完整 1500us");
+        assert_eq!(
+            ts2.0, 2_000,
+            "重叠帧仅计入非重叠增量 500us（总计 2000us），不得双算为 3300us"
+        );
     }
 }

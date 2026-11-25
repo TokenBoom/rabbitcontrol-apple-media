@@ -70,6 +70,20 @@ pub unsafe extern "C" fn rc_apple_media_string_free(ptr: *mut c_char) {
 
 // ── 全局帧槽 ──
 
+/// 零分配 C ABI 帧输出结构体（供 `rc_apple_media_frame_take_raw` 使用）。
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RcAppleFrame {
+    /// `CVPixelBufferRef` 裸指针（所有权已转移，用毕必须调 `rc_apple_media_frame_release`）。
+    pub ptr: u64,
+    /// 帧宽（像素）。
+    pub width: u32,
+    /// 帧高（像素）。
+    pub height: u32,
+    /// 单调递增帧序号。
+    pub seq: u64,
+}
+
 struct FrameSlot {
     /// 当前帧 CVPixelBuffer 指针(已 retain,槽位持有)。
     ptr: usize,
@@ -78,6 +92,8 @@ struct FrameSlot {
     /// 单调递增帧序号,客户端据此避免重复取帧。
     seq: u64,
 }
+
+static HAS_FRAME: AtomicBool = AtomicBool::new(false);
 
 fn frame_slot() -> &'static Mutex<FrameSlot> {
     static SLOT: OnceLock<Mutex<FrameSlot>> = OnceLock::new();
@@ -110,16 +126,22 @@ impl Renderer for FramePumpRenderer {
                 }
                 #[allow(unsafe_code)]
                 unsafe {
-                    // 跨帧持有必须自行 retain(解码器只保活到下一次 decode)。
+                    // 跨帧持有必须自行 retain(解码器只保活到下一次 decode/recv_decoded)。
                     CFRetain(ptr as CFTypeRef);
-                    let mut slot = frame_slot().lock().unwrap_or_else(|e| e.into_inner());
-                    if slot.ptr != 0 {
-                        CFRelease(slot.ptr as CFTypeRef);
+                    let old_ptr = {
+                        let mut slot = frame_slot().lock().unwrap_or_else(|e| e.into_inner());
+                        let old = slot.ptr;
+                        slot.ptr = ptr as usize;
+                        slot.width = frame.width;
+                        slot.height = frame.height;
+                        slot.seq = slot.seq.wrapping_add(1);
+                        HAS_FRAME.store(true, Ordering::Release);
+                        old
+                    };
+                    // 将旧帧 CFRelease 移出互斥锁临界区，避免 IOSurface 回收阻塞 UI 取帧。
+                    if old_ptr != 0 {
+                        CFRelease(old_ptr as CFTypeRef);
                     }
-                    slot.ptr = ptr as usize;
-                    slot.width = frame.width;
-                    slot.height = frame.height;
-                    slot.seq = slot.seq.wrapping_add(1);
                     FRAMES_CVPB.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(frame.decode_done_ts)
@@ -241,6 +263,42 @@ pub extern "C" fn rc_apple_media_init() -> i32 {
     }
 }
 
+/// 零分配快速取走当前最新帧(所有权转移)。
+///
+/// 无新帧时直接通过原子标志快退并返回 `false`（零锁、零堆分配）；
+/// 有新帧时写入 `*out` 并返回 `true`，用毕必须调 `rc_apple_media_frame_release(out.ptr)`。
+///
+/// # Safety
+/// `out` 必须为空指针（此时恒返回 `false`）或指向合法可写的 `RcAppleFrame`。
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn rc_apple_media_frame_take_raw(out: *mut RcAppleFrame) -> bool {
+    if out.is_null() || !HAS_FRAME.load(Ordering::Acquire) {
+        return false;
+    }
+    let taken = {
+        let mut slot = frame_slot().lock().unwrap_or_else(|e| e.into_inner());
+        if slot.ptr == 0 {
+            HAS_FRAME.store(false, Ordering::Release);
+            return false;
+        }
+        FRAMES_TAKEN.fetch_add(1, Ordering::Relaxed);
+        let f = RcAppleFrame {
+            ptr: slot.ptr as u64,
+            width: slot.width,
+            height: slot.height,
+            seq: slot.seq,
+        };
+        slot.ptr = 0;
+        HAS_FRAME.store(false, Ordering::Release);
+        f
+    };
+    unsafe {
+        out.write(taken);
+    }
+    true
+}
+
 /// 取走当前最新帧(所有权转移)。返回:
 /// `{"ptr": u64, "width": u32, "height": u32, "seq": u64}`,无帧时 `{}`。
 ///
@@ -249,29 +307,33 @@ pub extern "C" fn rc_apple_media_init() -> i32 {
 /// 返回的字符串用毕调 `rc_apple_media_string_free`。
 #[no_mangle]
 pub extern "C" fn rc_apple_media_frame_take() -> *mut c_char {
+    if !HAS_FRAME.load(Ordering::Acquire) {
+        return to_c_string("{}".to_string());
+    }
     let out = {
         let mut slot = frame_slot().lock().unwrap_or_else(|e| e.into_inner());
         if slot.ptr == 0 {
-            serde_json::json!({})
-        } else {
-            FRAMES_TAKEN.fetch_add(1, Ordering::Relaxed);
-            let taken = serde_json::json!({
-                "ptr": slot.ptr,
-                "width": slot.width,
-                "height": slot.height,
-                "seq": slot.seq,
-            });
-            slot.ptr = 0;
-            taken
+            HAS_FRAME.store(false, Ordering::Release);
+            return to_c_string("{}".to_string());
         }
+        FRAMES_TAKEN.fetch_add(1, Ordering::Relaxed);
+        let taken = serde_json::json!({
+            "ptr": slot.ptr,
+            "width": slot.width,
+            "height": slot.height,
+            "seq": slot.seq,
+        });
+        slot.ptr = 0;
+        HAS_FRAME.store(false, Ordering::Release);
+        taken
     };
     to_c_string(out.to_string())
 }
 
-/// 释放一帧 CVPixelBuffer(`rc_apple_media_frame_take` 取走的帧用毕必须调用)。
+/// 释放一帧 CVPixelBuffer(`rc_apple_media_frame_take` / `rc_apple_media_frame_take_raw` 取走的帧用毕必须调用)。
 ///
 /// # Safety
-/// `ptr` 必须为零或此前 `rc_apple_media_frame_take` 返回且尚未释放的帧指针;
+/// `ptr` 必须为零或此前 `rc_apple_media_frame_take` / `rc_apple_media_frame_take_raw` 返回且尚未释放的帧指针;
 /// 重复释放或传入非帧指针属于未定义行为。
 #[no_mangle]
 #[allow(unsafe_code)]
@@ -302,5 +364,18 @@ mod tests {
             .to_string();
         let _: serde_json::Value = serde_json::from_str(&s).unwrap();
         unsafe { super::rc_apple_media_string_free(ptr) };
+    }
+
+    #[test]
+    fn frame_take_raw_handles_null_and_empty() {
+        unsafe {
+            assert!(!super::rc_apple_media_frame_take_raw(std::ptr::null_mut()));
+            let mut out = super::RcAppleFrame::default();
+            // 先排空可能存在的残留，再断言空槽返回 false。
+            while super::rc_apple_media_frame_take_raw(&mut out) {
+                super::rc_apple_media_frame_release(out.ptr);
+            }
+            assert!(!super::rc_apple_media_frame_take_raw(&mut out));
+        }
     }
 }
