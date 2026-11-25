@@ -134,7 +134,15 @@ struct AppleMediaProvider;
 
 impl PlatformMediaProvider for AppleMediaProvider {
     fn supports_hevc(&self) -> bool {
-        true
+        // iOS 模拟器的 VideoToolbox 无 HEVC 硬解,默认回退 H.264;真机正常走 HEVC。
+        // `RC_FORCE_HEVC=1` / `RC_DISABLE_HEVC=1` 可双向覆盖,便于调试对照。
+        if std::env::var_os("RC_FORCE_HEVC").is_some() {
+            return true;
+        }
+        if std::env::var_os("RC_DISABLE_HEVC").is_some() {
+            return false;
+        }
+        !cfg!(target_abi = "sim")
     }
 
     fn create_decoder(

@@ -46,7 +46,7 @@ fn main() {
     let conn = call(
         rc_runtime_connect,
         &{
-            let mut j = serde_json::json!({"target_id":"898060465","watch_only":true,"width":1280,"height":720,"fps":30,"bitrate_bps":4000000,"timeout_sec":25});
+            let mut j = serde_json::json!({"target_id":"898060465","watch_only":true,"width":1920,"height":1080,"fps":30,"bitrate_bps":4000000,"timeout_sec":25});
             if let Ok(lan) = std::env::var("PROBE_LAN_DIRECT") {
                 j["lan_direct_addr"] = serde_json::json!(lan);
             }
