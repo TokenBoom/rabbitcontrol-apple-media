@@ -210,8 +210,7 @@ mod platform {
         }
 
         /// 已提交给 VideoToolbox 的帧数（测试断言「进一出一」用）。
-        #[cfg(test)]
-        pub(crate) fn submitted_frames(&self) -> u64 {
+        pub fn submitted_frames(&self) -> u64 {
             self.frame_id
         }
 

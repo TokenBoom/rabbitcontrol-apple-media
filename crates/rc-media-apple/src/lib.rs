@@ -77,6 +77,7 @@ fn frame_slot() -> &'static Mutex<FrameSlot> {
 /// 帧泵渲染器:不直接上屏,把每帧 CVPixelBuffer retain 进全局槽,
 /// 由客户端 UI 层(SwiftUI/CoreImage/Metal)取帧显示。
 struct FramePumpRenderer {
+    #[allow(dead_code)]
     size: (u32, u32),
 }
 

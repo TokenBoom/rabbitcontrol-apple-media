@@ -18,8 +18,10 @@ RabbitControl 的 Apple 平台(iOS/macOS)媒体库:**VideoToolbox 硬件 H.264 �
 
 ## 本地构建
 
-依赖相邻目录的 `../rabbitcontrol-core` 克隆(path 依赖;上游发布 tag 后可切 git 依赖):
+默认从 GitHub `TokenBoom/rabbitcontrol-core` 拉取 `tag = "v0.1.8"`：
 
 ```sh
 cargo build -p rc-media-apple --target aarch64-apple-ios-sim
 ```
+
+> 注：`crates/rc-media-apple/examples/e2e_session.rs` 依赖尚未合入 `rabbitcontrol-core` `main` 的 `rc-mobile-ffi`，默认通过 `autoexamples = false` 跳过编译。
