@@ -12,10 +12,10 @@ rust-version = "1.75"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
-rc-capture = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
-rc-client-core = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
-rc-decode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
-rc-encode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
-rc-pipeline = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
-rc-render = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
-rc-types = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.8" }
+rc-capture = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.9" }
+rc-client-core = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.9" }
+rc-decode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.9" }
+rc-encode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.9" }
+rc-pipeline = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.9" }
+rc-render = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.9" }
+rc-types = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.9" }
