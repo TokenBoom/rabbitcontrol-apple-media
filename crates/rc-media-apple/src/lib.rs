@@ -129,11 +129,16 @@ impl Renderer for FramePumpRenderer {
 struct AppleMediaProvider;
 
 impl PlatformMediaProvider for AppleMediaProvider {
+    fn supports_hevc(&self) -> bool {
+        true
+    }
+
     fn create_decoder(
         &self,
         cfg: &PipelineConfig,
     ) -> Result<(Box<dyn rc_decode::Decoder>, &'static str)> {
         let decoder = rc_decode_vt::new_decoder(rc_decode_vt::VtDecoderConfig {
+            codec: cfg.codec,
             max_resolution: rc_types::Resolution::new(
                 cfg.resolution.width.max(4096),
                 cfg.resolution.height.max(4096),

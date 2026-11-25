@@ -43,6 +43,7 @@ use objc2_core_foundation::{CFBoolean, CFRetained, CFString};
 use objc2_core_media::{
     kCMBlockBufferAlwaysCopyDataFlag, CMBlockBuffer, CMFormatDescription, CMSampleBuffer,
     CMSampleTimingInfo, CMTime, CMTimeFlags, CMVideoFormatDescriptionCreateFromH264ParameterSets,
+    CMVideoFormatDescriptionCreateFromHEVCParameterSets,
 };
 use objc2_core_video::{CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth};
 
@@ -69,11 +70,8 @@ const CMTIME_INVALID: CMTime = CMTime {
 
 /// `QOS_CLASS_USER_INTERACTIVE`（pthread/qos.h：`0x21`）。
 const QOS_CLASS_USER_INTERACTIVE: i32 = 0x21;
-/// `QOS_CLASS_UNSPECIFIED`（pthread/qos.h：`0x00`）——只由 getter 返回，
-/// 不是 set 的合法入参，恢复时映射为语义等价的 `QOS_CLASS_DEFAULT`。
+/// `QOS_CLASS_UNSPECIFIED`（pthread/qos.h：`0x00`）——只由 getter 返回。
 const QOS_CLASS_UNSPECIFIED: i32 = 0x00;
-/// `QOS_CLASS_DEFAULT`（pthread/qos.h：`0x15`）。
-const QOS_CLASS_DEFAULT: i32 = 0x15;
 
 /// pthread QoS C API 声明（pthread/qos.h）。
 mod qos_raw {
@@ -92,57 +90,31 @@ mod qos_raw {
     }
 }
 
-/// 把当前线程的 QoS 抬到 USER_INTERACTIVE，drop 时恢复原值（RAII）。
-///
-/// 与编码侧（rc-encode-vt 的 `QosBump`）同理：VideoToolbox C API 没有回调
-/// 队列 QoS 的设置入口，回调调度优先级继承提交线程；解码段的预算只有
-/// 3ms，默认 QoS 下系统负载会直接把它吃掉。抬升只覆盖一次
-/// [`DecompressionSession::decode_frame`]，任何退出路径都经 Drop 恢复。
-/// 任何一步失败都保持现状（QoS 不动，解码照常进行）。
-struct QosBump {
-    /// 恢复用的 `(class, priority)`；None = 无需恢复（读取/设置失败，或
-    /// 本就不低于目标——本就不动）。
-    restore: Option<(i32, i32)>,
-}
-
-impl QosBump {
-    fn new() -> Self {
+/// 每个解码线程仅抬升一次 QoS 到 `USER_INTERACTIVE`（避免每帧重复 3 次 pthread 系统调用）。
+fn promote_thread_qos_once() {
+    use std::cell::Cell;
+    thread_local! {
+        static PROMOTED: Cell<bool> = const { Cell::new(false) };
+    }
+    PROMOTED.with(|flag| {
+        if flag.get() {
+            return;
+        }
+        flag.set(true);
         let mut class: i32 = QOS_CLASS_UNSPECIFIED;
         let mut priority: i32 = 0;
-        // SAFETY: 两个出参指向本栈帧合法内存；pthread_self 返回当前线程
-        // 句柄，getter 是同步只读调用。
+        // SAFETY: 两个出参指向本栈帧合法内存；pthread_self 返回当前线程句柄。
         let ok = unsafe {
             qos_raw::pthread_get_qos_class_np(qos_raw::pthread_self(), &mut class, &mut priority)
         };
-        if ok != 0 || class >= QOS_CLASS_USER_INTERACTIVE {
-            return Self { restore: None };
+        if ok == 0 && class >= QOS_CLASS_USER_INTERACTIVE {
+            return;
         }
         // SAFETY: 只作用于当前线程；USER_INTERACTIVE 与 priority 0 是合法入参。
-        let ok = unsafe { qos_raw::pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
-        if ok != 0 {
-            return Self { restore: None };
+        unsafe {
+            qos_raw::pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
         }
-        Self {
-            restore: Some((class, priority)),
-        }
-    }
-}
-
-impl Drop for QosBump {
-    fn drop(&mut self) {
-        let Some((class, priority)) = self.restore else {
-            return;
-        };
-        // UNSPECIFIED 是 getter 专属值，不能回设，映射为语义等价的 DEFAULT。
-        let class = if class == QOS_CLASS_UNSPECIFIED {
-            QOS_CLASS_DEFAULT
-        } else {
-            class
-        };
-        // SAFETY: 只作用于当前线程；class 来自本线程 getter 的原值（或
-        // DEFAULT），priority 同理，均为合法入参。
-        unsafe { qos_raw::pthread_set_qos_class_self_np(class, priority) };
-    }
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -363,7 +335,46 @@ impl DecompressionSession {
             .ok_or_else(|| {
                 "CMVideoFormatDescriptionCreateFromH264ParameterSets 返回 0 但描述为空".to_string()
             })?;
+        Self::from_format_description(desc)
+    }
 
+    /// 从 HEVC 参数集（VPS/SPS/PPS 的 NAL 载荷，含 2 字节 NAL 头）建格式描述并创建解码会话。
+    pub(crate) fn new_hevc(vps: &[u8], sps: &[u8], pps: &[u8]) -> Result<Self, String> {
+        let pointers = [
+            NonNull::from(vps).cast::<u8>(),
+            NonNull::from(sps).cast::<u8>(),
+            NonNull::from(pps).cast::<u8>(),
+        ];
+        let sizes = [vps.len(), sps.len(), pps.len()];
+        let mut desc_out: *const CMFormatDescription = std::ptr::null();
+        // SAFETY: pointers/sizes 指向栈上数组（调用期间存活），参数集切片由调用方保活到 Create 同步返回；
+        // nal 头长度 4 必须与 HVCC 4 字节长度前缀一致。
+        let status = unsafe {
+            CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                None,
+                3,
+                NonNull::from(pointers.as_slice()).cast(),
+                NonNull::from(sizes.as_slice()).cast(),
+                4,
+                None,
+                NonNull::from(&mut desc_out),
+            )
+        };
+        if status != 0 {
+            return Err(format!(
+                "CMVideoFormatDescriptionCreateFromHEVCParameterSets 失败: OSStatus {status}"
+            ));
+        }
+        // SAFETY: Create 成功（status==0）时 desc_out 是 +1 所有权引用。
+        let desc = NonNull::new(desc_out as *mut CMFormatDescription)
+            .map(|ptr| unsafe { CFRetained::from_raw(ptr) })
+            .ok_or_else(|| {
+                "CMVideoFormatDescriptionCreateFromHEVCParameterSets 返回 0 但描述为空".to_string()
+            })?;
+        Self::from_format_description(desc)
+    }
+
+    fn from_format_description(desc: CFRetained<CMFormatDescription>) -> Result<Self, String> {
         // 2. 建解码会话。decoder_specification / image_buffer_attributes 传
         //    null：系统默认解码器（优先硬件、软件兜底，见模块文档的选择理由）；
         //    输出格式由解码器原生决定（NV12），对零拷贝渲染最友好。
@@ -450,9 +461,8 @@ impl DecompressionSession {
         frame_id: u64,
         wait: Duration,
     ) -> Result<DecodeOutput, DecodeFailure> {
-        // 解码提交/等待按 USER_INTERACTIVE 调度（回调队列 QoS 继承提交线程，
-        // 见 QosBump 文档）；guard 在任何退出路径恢复原值。
-        let _qos = QosBump::new();
+        // 解码提交/等待按 USER_INTERACTIVE 调度（回调队列 QoS 继承提交线程）。
+        promote_thread_qos_once();
         // 仅当上一帧超时或提交异常退出时才清邮箱残留（常规帧路径跳过多余 Mutex 锁）。
         if self.mailbox_dirty {
             self.mailbox.clear();

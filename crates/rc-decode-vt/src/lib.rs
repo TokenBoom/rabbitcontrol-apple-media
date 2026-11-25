@@ -48,6 +48,10 @@
 #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
 pub(crate) mod h264;
 
+/// HEVC Annex-B 解析 / Annex-B → HVCC 转换与参数集提取（纯函数，跨平台可测）。
+#[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
+pub(crate) mod h265;
+
 /// 帧序邮箱：解码回调 → 等待线程的单帧结果收集（D5 顺序核心，纯 Rust）。
 #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
 pub(crate) mod mailbox;
@@ -55,7 +59,7 @@ pub(crate) mod mailbox;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) mod ffi;
 
-use rc_encode::BitstreamFormat;
+use rc_encode::{BitstreamFormat, Codec};
 use rc_types::Resolution;
 
 /// 预估单帧解码耗时（微秒）：deadline 预检用（与 rc-decode 假解码器的
@@ -106,9 +110,11 @@ impl RefChainGate {
 /// 一致（本后端只支持 Annex-B 输入，坑 #7）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VtDecoderConfig {
+    /// 目标编解码器（当前支持 H.264 与 HEVC/H.265）。
+    pub codec: Codec,
     /// 输入码流封装格式。**必须为 [`BitstreamFormat::AnnexB`]**：
     /// 管线统一消费 Annex-B（rc-encode-vt 输出侧已重排并声明），本后端
-    /// 在内部转 AVCC 喂 VideoToolbox——两种封装不能混用，不匹配在
+    /// 在内部转 AVCC/HVCC 喂 VideoToolbox——两种封装不能混用，不匹配在
     /// 构造期报错而不是运行期花屏。
     pub bitstream_format: BitstreamFormat,
     /// 接受的最大帧尺寸（SPS 声明超限的码流在进 FFI 前被拒绝，恶意/损坏
@@ -117,9 +123,10 @@ pub struct VtDecoderConfig {
 }
 
 impl Default for VtDecoderConfig {
-    /// Annex-B 输入、4096×4096 上限——与 rc-encode-vt 的 caps 声明对齐。
+    /// Annex-B 输入、H.264 默认编解码器、4096×4096 上限——与 rc-encode-vt 的 caps 声明对齐。
     fn default() -> Self {
         VtDecoderConfig {
+            codec: Codec::H264,
             bitstream_format: BitstreamFormat::AnnexB,
             max_resolution: Resolution::new(4096, 4096),
         }
@@ -130,6 +137,12 @@ impl VtDecoderConfig {
     /// 校验配置。非法项以 [`Error::InvalidConfig`](rc_types::Error::InvalidConfig)
     /// 返回，信息含字段与期望值。
     pub fn validate(&self) -> rc_types::Result<()> {
+        if !matches!(self.codec, Codec::H264 | Codec::Hevc) {
+            return Err(rc_types::Error::InvalidConfig(format!(
+                "rc-decode-vt 仅支持 H.264 / HEVC 解码，当前 {:?}",
+                self.codec
+            )));
+        }
         if self.bitstream_format != BitstreamFormat::AnnexB {
             return Err(rc_types::Error::InvalidConfig(format!(
                 "rc-decode-vt 只接受 Annex-B 输入（EncoderCaps::bitstream_format 必须为 annexb，当前 {}）；\
@@ -151,6 +164,7 @@ mod platform {
     use super::{ffi, RefChainGate, VtDecoderConfig, ESTIMATED_DECODE_COST_US};
     use rc_capture::FrameTexture;
     use rc_decode::{DecodeOutput, DecodedFrame, Decoder};
+    use rc_encode::Codec;
     use rc_types::{Error, FrameKind, Result, Timestamp};
     use std::fmt;
     use std::time::{Duration, Instant};
@@ -166,10 +180,10 @@ mod platform {
     pub struct VtDecoder {
         cfg: VtDecoderConfig,
         gate: RefChainGate,
-        /// 惰性建立的解码会话；SPS 变化时重建。
+        /// 惰性建立的解码会话；参数集变化时重建。
         session: Option<ffi::DecompressionSession>,
-        /// 当前会话对应的 SPS（字节比较，检测参数集变化/分辨率切换）。
-        session_sps: Option<Vec<u8>>,
+        /// 当前会话对应的参数集键（H.264 为 SPS；HEVC 为 VPS||SPS||PPS，检测变化与分辨率切换）。
+        session_params: Option<Vec<u8>>,
         /// 会话内单调帧号（邮箱匹配 + PTS 单调）。
         frame_id: u64,
         /// 逻辑时钟（微秒，与 `Timestamp` 同为 u32 域）：最近一次实际解码
@@ -202,7 +216,7 @@ mod platform {
                 cfg,
                 gate: RefChainGate::new(),
                 session: None,
-                session_sps: None,
+                session_params: None,
                 frame_id: 0,
                 clock_us: 0,
                 avcc_scratch: Vec::new(),
@@ -229,9 +243,85 @@ mod platform {
             kind: FrameKind,
             deadline_ts: Timestamp,
         ) -> Result<DecodeOutput> {
-            // 1) 严格解析（纯逻辑，无 FFI）：非 Annex-B / 畸形输入在这里现形。
-            //    bitstream_format 由配置声明并已校验（坑 #7）；形态不符的
-            //    字节（如 AVCC 长度前缀流）不进 VideoToolbox。
+            // 若调用方会话时间戳从高值回绕或被重置，归零逻辑时钟以防假超时。
+            if deadline_ts.0 < self.clock_us
+                && self.clock_us.wrapping_sub(deadline_ts.0) > u32::MAX / 2
+            {
+                self.clock_us = 0;
+            }
+
+            match self.cfg.codec {
+                Codec::H264 => self.decode_h264(data, kind, deadline_ts),
+                Codec::Hevc => self.decode_hevc(data, kind, deadline_ts),
+                other => Err(Error::InvalidConfig(format!(
+                    "rc-decode-vt 不支持解码器 {:?}",
+                    other
+                ))),
+            }
+        }
+
+        fn needs_keyframe(&self) -> bool {
+            // 参考链断裂（含「从未解出过 IDR」）即需要关键帧。
+            !self.gate.is_ok()
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            // D5：进一出一的实现没有内部缓冲，无帧可冲刷。
+            Ok(())
+        }
+    }
+
+    impl VtDecoder {
+        fn finish_decode(
+            &mut self,
+            kind: FrameKind,
+            content_is_idr: bool,
+            deadline_ts: Timestamp,
+        ) -> Result<DecodeOutput> {
+            let Some(session) = self.session.as_mut() else {
+                return Ok(DecodeOutput::NeedKeyframe);
+            };
+            let _ = kind;
+            let frame_id = self.frame_id;
+            self.frame_id = frame_id
+                .checked_add(1)
+                .ok_or_else(|| Error::Decoder("会话帧号耗尽 u64".to_string()))?;
+            let max_wait_us = if content_is_idr { 100_000 } else { 25_000 };
+            let raw_wait_us = deadline_ts.0.saturating_sub(self.clock_us).max(1);
+            let wait = Duration::from_micros(u64::from(raw_wait_us.min(max_wait_us)));
+            let started = Instant::now();
+            match session.decode_frame(&self.avcc_scratch, frame_id, wait) {
+                Ok(out) => {
+                    let done_ts = self.advance_clock(started.elapsed());
+                    if content_is_idr {
+                        self.gate.mark_idr_decoded();
+                    }
+                    Ok(DecodeOutput::Frame(DecodedFrame {
+                        texture: FrameTexture::CVPixelBuffer(out.ptr),
+                        decode_done_ts: done_ts,
+                        width: out.width,
+                        height: out.height,
+                    }))
+                }
+                Err(ffi::DecodeFailure::Timeout) => {
+                    self.gate.break_chain();
+                    let elapsed = started.elapsed();
+                    self.advance_clock(elapsed);
+                    Err(Error::Timeout(elapsed))
+                }
+                Err(e) => {
+                    self.gate.break_chain();
+                    Err(Error::Decoder(e.to_string()))
+                }
+            }
+        }
+
+        fn decode_h264(
+            &mut self,
+            data: &[u8],
+            kind: FrameKind,
+            deadline_ts: Timestamp,
+        ) -> Result<DecodeOutput> {
             let nals = crate::h264::split_nals(data).ok_or_else(|| {
                 Error::InvalidFrame(format!(
                     "rc-decode-vt: 码流不是合法 Annex-B（配置声明 bitstream_format={}）：{} 字节输入",
@@ -240,8 +330,6 @@ mod platform {
                 ))
             })?;
 
-            // 2) 声明与内容一致性：发送端的 kind 不得说谎（协议 bug 在这里
-            //    暴露，而不是让参考链语义悄悄错掉）。
             let content_is_idr = nals.iter().any(|(t, _)| *t == 5);
             match (kind, content_is_idr) {
                 (FrameKind::Idr, false) => {
@@ -257,8 +345,6 @@ mod platform {
                 _ => {}
             }
 
-            // 3) deadline 预检（注入时间域，先于任何状态变更）：预计完成
-            //    时刻超过截止立即超时，不提交、不等待、不消耗帧号。
             let est_done_us = self.clock_us.saturating_add(ESTIMATED_DECODE_COST_US);
             if est_done_us > deadline_ts.0 {
                 return Err(Error::Timeout(Duration::from_micros(u64::from(
@@ -266,25 +352,19 @@ mod platform {
                 ))));
             }
 
-            // 4) D4 门：链断（含首个 IDR 前）且本帧不自足 → NeedKeyframe。
-            //    不 panic、不碰 FFI；置位与返回总是同时出现。
             if !self.gate.is_ok() && !content_is_idr {
                 return Ok(DecodeOutput::NeedKeyframe);
             }
 
-            // 5) IDR：确保会话存在 / SPS 变化时重建（分辨率切换路径）。
             if content_is_idr {
                 let (sps, pps) = crate::h264::parameter_sets(&nals);
                 match (sps, pps) {
                     (Some(sps), Some(pps)) => {
-                        let needs_rebuild = match self.session_sps.as_deref() {
+                        let needs_rebuild = match self.session_params.as_deref() {
                             Some(cur) => cur != sps,
                             None => true,
                         };
                         if needs_rebuild {
-                            // 守门：SPS 声明尺寸超上限的码流不进 FFI
-                            //（恶意/损坏 SPS 防御；解析不了的交给 VT 权威，
-                            //  构造期失败会变 Err）。
                             if let Some((w, h)) = crate::h264::sps_dimensions(sps) {
                                 if w > self.cfg.max_resolution.width
                                     || h > self.cfg.max_resolution.height
@@ -299,75 +379,106 @@ mod platform {
                             self.session = Some(
                                 ffi::DecompressionSession::new(sps, pps).map_err(Error::Decoder)?,
                             );
-                            self.session_sps = Some(sps.to_vec());
+                            self.session_params = Some(sps.to_vec());
                         }
                     }
-                    // IDR 不带参数集：没有会话就无从建格式描述——需要一个
-                    // 带 SPS/PPS 的 IDR（这正是 NeedKeyframe 的语义）。
                     _ if self.session.is_none() => return Ok(DecodeOutput::NeedKeyframe),
                     _ => {}
                 }
             }
 
-            // 6) 会话必须就绪（P 帧 + 链 OK ⇔ 会话存在；防御兜底不 panic）。
-            let Some(session) = self.session.as_mut() else {
+            if self.session.is_none() {
                 return Ok(DecodeOutput::NeedKeyframe);
-            };
+            }
 
-            // 7) Annex-B → AVCC（复用步骤 1 的切分结果与可复用暂存区，剥离参数集）。
-            //    「只有参数集没有 slice」的畸形在这里兜住。
             if crate::h264::nals_to_avcc_into(&nals, &mut self.avcc_scratch).is_none() {
                 return Err(Error::InvalidFrame(
                     "帧不含任何 slice NAL（无法解码出画面）".to_string(),
                 ));
             }
 
-            // 8) 提交 + 邮箱等待（D5）：帧号单调，墙钟预算 = 剩余注入预算。
-            let frame_id = self.frame_id;
-            self.frame_id = frame_id
-                .checked_add(1)
-                .ok_or_else(|| Error::Decoder("会话帧号耗尽 u64".to_string()))?;
-            let wait = Duration::from_micros(
-                u64::from(deadline_ts.0.saturating_sub(self.clock_us)).max(1),
-            );
-            let started = Instant::now();
-            match session.decode_frame(&self.avcc_scratch, frame_id, wait) {
-                Ok(out) => {
-                    let done_ts = self.advance_clock(started.elapsed());
-                    if content_is_idr {
-                        self.gate.mark_idr_decoded();
+            self.finish_decode(kind, content_is_idr, deadline_ts)
+        }
+
+        fn decode_hevc(
+            &mut self,
+            data: &[u8],
+            kind: FrameKind,
+            deadline_ts: Timestamp,
+        ) -> Result<DecodeOutput> {
+            let nals = crate::h265::split_nals(data).ok_or_else(|| {
+                Error::InvalidFrame(format!(
+                    "rc-decode-vt: HEVC 码流不是合法 Annex-B（配置声明 bitstream_format={}）：{} 字节输入",
+                    self.cfg.bitstream_format.as_str(),
+                    data.len()
+                ))
+            })?;
+
+            let content_is_idr = nals.iter().any(|(t, _)| crate::h265::is_irap_nal(*t));
+            match (kind, content_is_idr) {
+                (FrameKind::Idr, false) => {
+                    return Err(Error::InvalidFrame(
+                        "声明为 IDR 但 HEVC 码流不含 IRAP/IDR slice".to_string(),
+                    ))
+                }
+                (FrameKind::P, true) => {
+                    return Err(Error::InvalidFrame(
+                        "声明为 P 但 HEVC 码流含 IRAP/IDR slice".to_string(),
+                    ))
+                }
+                _ => {}
+            }
+
+            let est_done_us = self.clock_us.saturating_add(ESTIMATED_DECODE_COST_US);
+            if est_done_us > deadline_ts.0 {
+                return Err(Error::Timeout(Duration::from_micros(u64::from(
+                    est_done_us - deadline_ts.0,
+                ))));
+            }
+
+            if !self.gate.is_ok() && !content_is_idr {
+                return Ok(DecodeOutput::NeedKeyframe);
+            }
+
+            if content_is_idr {
+                let params = crate::h265::parameter_sets(&nals);
+                match (params.vps, params.sps, params.pps) {
+                    (Some(vps), Some(sps), Some(pps)) => {
+                        let mut key = Vec::with_capacity(vps.len() + sps.len() + pps.len() + 6);
+                        key.extend_from_slice(&(vps.len() as u16).to_be_bytes());
+                        key.extend_from_slice(vps);
+                        key.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+                        key.extend_from_slice(sps);
+                        key.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+                        key.extend_from_slice(pps);
+                        let needs_rebuild = match self.session_params.as_deref() {
+                            Some(cur) => cur != key.as_slice(),
+                            None => true,
+                        };
+                        if needs_rebuild {
+                            self.session = Some(
+                                ffi::DecompressionSession::new_hevc(vps, sps, pps)
+                                    .map_err(Error::Decoder)?,
+                            );
+                            self.session_params = Some(key);
+                        }
                     }
-                    // D1：零拷贝句柄直通（会话保活到下一次 decode）。
-                    Ok(DecodeOutput::Frame(DecodedFrame {
-                        texture: FrameTexture::CVPixelBuffer(out.ptr),
-                        decode_done_ts: done_ts,
-                        width: out.width,
-                        height: out.height,
-                    }))
-                }
-                Err(ffi::DecodeFailure::Timeout) => {
-                    // 跳帧断链（后续帧将缺参考）+ 迟到输出下次丢弃。
-                    self.gate.break_chain();
-                    let elapsed = started.elapsed();
-                    self.advance_clock(elapsed);
-                    Err(Error::Timeout(elapsed))
-                }
-                Err(e) => {
-                    // 回调错误/提交失败：断链，恢复统一走 IDR。
-                    self.gate.break_chain();
-                    Err(Error::Decoder(e.to_string()))
+                    _ if self.session.is_none() => return Ok(DecodeOutput::NeedKeyframe),
+                    _ => {}
                 }
             }
-        }
 
-        fn needs_keyframe(&self) -> bool {
-            // 参考链断裂（含「从未解出过 IDR」）即需要关键帧。
-            !self.gate.is_ok()
-        }
+            if self.session.is_none() {
+                return Ok(DecodeOutput::NeedKeyframe);
+            }
 
-        fn flush(&mut self) -> Result<()> {
-            // D5：进一出一的实现没有内部缓冲，无帧可冲刷。
-            Ok(())
+            if crate::h265::nals_to_hvcc_into(&nals, &mut self.avcc_scratch).is_none() {
+                return Err(Error::InvalidFrame(
+                    "HEVC 帧不含任何 slice NAL（无法解码出画面）".to_string(),
+                ));
+            }
+
+            self.finish_decode(kind, content_is_idr, deadline_ts)
         }
     }
 }
@@ -515,5 +626,55 @@ mod gates_no_gpu {
 
         // flush：无缓冲，恒 Ok。
         dec.flush().expect("进一出一的实现没有缓冲");
+    }
+
+    #[test]
+    fn hevc_decoder_gates_and_config_validation() {
+        assert!(VtDecoderConfig {
+            codec: Codec::Hevc,
+            ..VtDecoderConfig::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(VtDecoderConfig {
+            codec: Codec::Av1,
+            ..VtDecoderConfig::default()
+        }
+        .validate()
+        .is_err());
+
+        let mut dec = VtDecoder::new(VtDecoderConfig {
+            codec: Codec::Hevc,
+            ..VtDecoderConfig::default()
+        })
+        .expect("HEVC 配置合法");
+        assert!(dec.needs_keyframe());
+
+        // HEVC TRAIL_R (nal_type 1 -> byte0 = 0x02) + layer/tid byte1 = 0x01
+        let hevc_p = vec![0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x42, 0x43];
+        // HEVC IDR_W_RADL (nal_type 19 -> byte0 = 0x26) + byte1 = 0x01
+        let hevc_idr = vec![0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0x42, 0x43];
+
+        assert!(matches!(
+            dec.decode(&hevc_p, FrameKind::P, Timestamp(10_000_000)),
+            Ok(DecodeOutput::NeedKeyframe)
+        ));
+        assert!(matches!(
+            dec.decode(&hevc_idr, FrameKind::Idr, Timestamp(10_000_000)),
+            Ok(DecodeOutput::NeedKeyframe)
+        ));
+        assert!(dec
+            .decode(&hevc_p, FrameKind::Idr, Timestamp(10_000_000))
+            .is_err());
+        assert!(dec
+            .decode(&hevc_idr, FrameKind::P, Timestamp(10_000_000))
+            .is_err());
+        assert!(dec
+            .decode(
+                &[0x00, 0x00, 0x00, 0x01, 0x26],
+                FrameKind::Idr,
+                Timestamp(10_000_000)
+            )
+            .is_err());
     }
 }
