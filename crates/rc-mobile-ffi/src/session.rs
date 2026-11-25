@@ -102,7 +102,7 @@ pub extern "C" fn rc_session_open(json: *const c_char) -> *mut c_char {
             bitrate_bps: req.bitrate_bps,
             prefer_hardware: true,
             clipboard_enabled: false,
-            audio_enabled: false,
+            audio_enabled: cfg!(target_os = "ios"),
             ..UiSessionConfig::default()
         };
         let handle = SessionHandle::spawn(cfg);

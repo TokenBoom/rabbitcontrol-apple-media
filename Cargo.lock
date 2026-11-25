@@ -915,6 +915,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-media",
  "objc2-core-video",
+ "rc-audio",
  "rc-capture",
  "rc-client-core",
  "rc-decode",
@@ -922,6 +923,7 @@ dependencies = [
  "rc-encode",
  "rc-pipeline",
  "rc-render",
+ "rc-session",
  "rc-types",
  "serde_json",
 ]

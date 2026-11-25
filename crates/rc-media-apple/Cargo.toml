@@ -12,6 +12,8 @@ autoexamples = false
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
+rc-audio = { workspace = true }
+rc-session = { workspace = true }
 rc-decode-vt = { path = "../rc-decode-vt" }
 rc-client-core = { workspace = true }
 rc-pipeline = { workspace = true }

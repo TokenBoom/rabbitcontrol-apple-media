@@ -186,6 +186,21 @@ pub extern "C" fn rc_auth_refresh(json: *const c_char) -> *mut c_char {
     }
 }
 
+/// 撤销钥匙串持有的登录会话。
+#[no_mangle]
+pub extern "C" fn rc_auth_logout(json: *const c_char) -> *mut c_char {
+    let result = parse_json::<TokenRequest>(json).and_then(|req| {
+        let access = req.access_token.ok_or("缺少 access_token")?;
+        let refresh = req.refresh_token.ok_or("缺少 refresh_token")?;
+        Ok(client(&req.server)?.logout(&access, Some(&refresh), None))
+    });
+    match result {
+        Ok(Ok(())) => to_c_string(r#"{"ok":true}"#.into()),
+        Ok(Err(error)) => to_c_string(error_json(&error)),
+        Err(error) => to_c_string(serde_json::json!({"error":error}).to_string()),
+    }
+}
+
 /// 列出当前账号设备。输入:`{server..., access_token}`;成功返回 `MyDeviceInfo` 数组。
 #[no_mangle]
 pub extern "C" fn rc_auth_list_devices(json: *const c_char) -> *mut c_char {
