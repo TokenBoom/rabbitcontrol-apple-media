@@ -10,7 +10,7 @@
 //! 限制(v1):全局单帧槽,假定同一时刻只有一路会话。
 
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rc_capture::FrameTexture;
@@ -101,11 +101,15 @@ impl Renderer for FramePumpRenderer {
                     slot.width = frame.width;
                     slot.height = frame.height;
                     slot.seq = slot.seq.wrapping_add(1);
+                    FRAMES_CVPB.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(frame.decode_done_ts)
             }
             // CPU 帧(软件路径)暂不上屏,静默吞掉保持管线存活。
-            _ => Ok(frame.decode_done_ts),
+            _ => {
+                FRAMES_CPU.fetch_add(1, Ordering::Relaxed);
+                Ok(frame.decode_done_ts)
+            }
         }
     }
 
@@ -171,6 +175,24 @@ impl rc_client_core::platform::ClientPlatformHooks for AppleMediaHooks {
 }
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
+static FRAMES_CVPB: AtomicU64 = AtomicU64::new(0);
+static FRAMES_CPU: AtomicU64 = AtomicU64::new(0);
+static FRAMES_TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// 帧链路诊断计数:`{"presented_cvpb":n,"presented_cpu":n,"taken":n}`。
+/// presented_cvpb=0 且 presented_cpu>0 → 解码走了软件兜底(CPU 帧被吞,黑屏根因);
+/// 两者皆 0 → 网络/会话侧无帧到达。
+#[no_mangle]
+pub extern "C" fn rc_apple_media_stats() -> *mut c_char {
+    to_c_string(
+        serde_json::json!({
+            "presented_cvpb": FRAMES_CVPB.load(Ordering::Relaxed),
+            "presented_cpu": FRAMES_CPU.load(Ordering::Relaxed),
+            "taken": FRAMES_TAKEN.load(Ordering::Relaxed),
+        })
+        .to_string(),
+    )
+}
 
 /// 注册 Apple 媒体通路(幂等),返回 1 成功。打开会话前必须调用一次。
 #[no_mangle]
@@ -200,6 +222,7 @@ pub extern "C" fn rc_apple_media_frame_take() -> *mut c_char {
         if slot.ptr == 0 {
             serde_json::json!({})
         } else {
+            FRAMES_TAKEN.fetch_add(1, Ordering::Relaxed);
             let taken = serde_json::json!({
                 "ptr": slot.ptr,
                 "width": slot.width,
