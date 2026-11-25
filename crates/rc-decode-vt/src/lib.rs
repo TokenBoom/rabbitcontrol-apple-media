@@ -451,12 +451,21 @@ mod platform {
                 let params = crate::h265::parameter_sets(&nals);
                 match (params.vps, params.sps, params.pps) {
                     (Some(vps), Some(sps), Some(pps)) => {
+                        let vps_len = u16::try_from(vps.len()).map_err(|_| {
+                            Error::InvalidFrame("HEVC VPS 长度超过 u16::MAX".to_string())
+                        })?;
+                        let sps_len = u16::try_from(sps.len()).map_err(|_| {
+                            Error::InvalidFrame("HEVC SPS 长度超过 u16::MAX".to_string())
+                        })?;
+                        let pps_len = u16::try_from(pps.len()).map_err(|_| {
+                            Error::InvalidFrame("HEVC PPS 长度超过 u16::MAX".to_string())
+                        })?;
                         let mut key = Vec::with_capacity(vps.len() + sps.len() + pps.len() + 6);
-                        key.extend_from_slice(&(vps.len() as u16).to_be_bytes());
+                        key.extend_from_slice(&vps_len.to_be_bytes());
                         key.extend_from_slice(vps);
-                        key.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+                        key.extend_from_slice(&sps_len.to_be_bytes());
                         key.extend_from_slice(sps);
-                        key.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+                        key.extend_from_slice(&pps_len.to_be_bytes());
                         key.extend_from_slice(pps);
                         let needs_rebuild = match self.session_params.as_deref() {
                             Some(cur) => cur != key.as_slice(),
@@ -464,8 +473,17 @@ mod platform {
                         };
                         if needs_rebuild {
                             self.session = Some(
-                                ffi::DecompressionSession::new_hevc(vps, sps, pps)
-                                    .map_err(Error::Decoder)?,
+                                ffi::DecompressionSession::new_hevc(
+                                    vps,
+                                    sps,
+                                    pps,
+                                    self.cfg.max_resolution.width,
+                                    self.cfg.max_resolution.height,
+                                )
+                                .map_err(|e| match e {
+                                    Ok(dec_err) => Error::Decoder(dec_err),
+                                    Err(frame_err) => Error::InvalidFrame(frame_err),
+                                })?,
                             );
                             self.session_params = Some(key);
                         }

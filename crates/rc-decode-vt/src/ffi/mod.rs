@@ -43,7 +43,7 @@ use objc2_core_foundation::{CFBoolean, CFRetained, CFString};
 use objc2_core_media::{
     kCMBlockBufferAlwaysCopyDataFlag, CMBlockBuffer, CMFormatDescription, CMSampleBuffer,
     CMSampleTimingInfo, CMTime, CMTimeFlags, CMVideoFormatDescriptionCreateFromH264ParameterSets,
-    CMVideoFormatDescriptionCreateFromHEVCParameterSets,
+    CMVideoFormatDescriptionCreateFromHEVCParameterSets, CMVideoFormatDescriptionGetDimensions,
 };
 use objc2_core_video::{CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth};
 
@@ -338,8 +338,14 @@ impl DecompressionSession {
         Self::from_format_description(desc)
     }
 
-    /// 从 HEVC 参数集（VPS/SPS/PPS 的 NAL 载荷，含 2 字节 NAL 头）建格式描述并创建解码会话。
-    pub(crate) fn new_hevc(vps: &[u8], sps: &[u8], pps: &[u8]) -> Result<Self, String> {
+    /// 从 HEVC 参数集（VPS/SPS/PPS 的 NAL 载荷，含 2 字节 NAL 头）建格式描述，先校验分辨率不超过上限再创建解码会话。
+    pub(crate) fn new_hevc(
+        vps: &[u8],
+        sps: &[u8],
+        pps: &[u8],
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Self, Result<String, String>> {
         let pointers = [
             NonNull::from(vps).cast::<u8>(),
             NonNull::from(sps).cast::<u8>(),
@@ -361,17 +367,32 @@ impl DecompressionSession {
             )
         };
         if status != 0 {
-            return Err(format!(
+            return Err(Ok(format!(
                 "CMVideoFormatDescriptionCreateFromHEVCParameterSets 失败: OSStatus {status}"
-            ));
+            )));
         }
         // SAFETY: Create 成功（status==0）时 desc_out 是 +1 所有权引用。
         let desc = NonNull::new(desc_out as *mut CMFormatDescription)
             .map(|ptr| unsafe { CFRetained::from_raw(ptr) })
             .ok_or_else(|| {
-                "CMVideoFormatDescriptionCreateFromHEVCParameterSets 返回 0 但描述为空".to_string()
+                Ok(
+                    "CMVideoFormatDescriptionCreateFromHEVCParameterSets 返回 0 但描述为空"
+                        .to_string(),
+                )
             })?;
-        Self::from_format_description(desc)
+        // SAFETY: desc 为合法视频格式描述，CMVideoFormatDescriptionGetDimensions 同步只读解析其尺寸。
+        let dims = unsafe { CMVideoFormatDescriptionGetDimensions(&desc) };
+        if dims.width <= 0
+            || dims.height <= 0
+            || dims.width as u32 > max_width
+            || dims.height as u32 > max_height
+        {
+            return Err(Err(format!(
+                "HEVC SPS 声明 {}x{} 超过解码上限 {}x{}",
+                dims.width, dims.height, max_width, max_height
+            )));
+        }
+        Self::from_format_description(desc).map_err(Ok)
     }
 
     fn from_format_description(desc: CFRetained<CMFormatDescription>) -> Result<Self, String> {
