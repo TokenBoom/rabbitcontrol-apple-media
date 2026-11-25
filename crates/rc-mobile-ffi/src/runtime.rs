@@ -18,13 +18,13 @@ use rc_client_core::cert_manager::CertManager;
 use rc_client_core::relay_transport::SessionMtlsBundle;
 use rc_client_core::server_config::ServerConfig;
 use rc_client_core::session_bridge::{SessionHandle, UiSessionConfig};
-use rc_client_core::signal_client::SignalClientHandle;
+use rc_client_core::signal_client::{SignalClientHandle, SignalClientOptions};
 use serde::Deserialize;
 
 use crate::{read_c_str, to_c_string};
 
 struct Runtime {
-    auth: AuthSessionManager,
+    auth: Arc<AuthSessionManager>,
     cert_manager: Arc<CertManager>,
     signal: Mutex<Option<Arc<SignalClientHandle>>>,
 }
@@ -123,7 +123,7 @@ pub extern "C" fn rc_runtime_init(json: *const c_char) -> *mut c_char {
         let _ = auth.restore_on_startup();
         let pubkey = cert_manager.device_pubkey_hex();
         *lock_rt() = Some(Runtime {
-            auth,
+            auth: Arc::new(auth),
             cert_manager,
             signal: Mutex::new(None),
         });
@@ -249,10 +249,24 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
                 .hostname
                 .clone()
                 .unwrap_or_else(|| "ios-device".to_string());
-            let handle = SignalClientHandle::spawn(
+            let auth_for_token = Arc::clone(&rt.auth);
+            let token_provider: rc_client_core::signal_client::TokenProvider =
+                Arc::new(move || {
+                    auth_for_token
+                        .ensure_valid_access_token()
+                        .map_err(|e| format!("{e:?}"))
+                });
+            let handle = SignalClientHandle::spawn_with_options(
                 cfg.clone(),
                 hostname,
                 req.lan_addrs.clone().unwrap_or_default(),
+                SignalClientOptions {
+                    token_provider: Some(token_provider),
+                    device_pubkey: Some(rt.cert_manager.device_pubkey_hex()),
+                    allow_remote_assist: false,
+                    dynamic_lan_discovery: true,
+                },
+                |_| {},
             );
             *slot = Some(Arc::new(handle));
         }
@@ -317,6 +331,22 @@ fn default_timeout() -> u64 {
 
 /// 一键连接设备:信令 request_connect → 组装路由/mTLS/免密票据 → 开会话。
 /// 阻塞至拿到连接授权(默认 15s 超时)。返回 `{"session_id": N, "owner_connection": bool}`。
+#[no_mangle]
+pub extern "C" fn rc_signal_status(_json: *const c_char) -> *mut c_char {
+    let guard = lock_rt();
+    let Some(rt) = guard.as_ref() else {
+        return err_json("运行时未初始化");
+    };
+    let slot = rt.signal.lock().unwrap_or_else(|e| e.into_inner());
+    match slot.as_ref() {
+        Some(handle) => {
+            let snap = handle.status();
+            to_c_string(serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
+        }
+        None => err_json("信令未启动"),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn rc_runtime_connect(json: *const c_char) -> *mut c_char {
     let req: ConnectReq = match parse(json) {
