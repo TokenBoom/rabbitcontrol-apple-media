@@ -1,0 +1,69 @@
+name: Release xcframework
+
+# tag(push v*)或手动触发:构建 iOS 预编译产物 RabbitControlCore.xcframework 并发布到 GitHub Release。
+# iOS 仓 CI 直接下载该产物,不再现场编译 Rust。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "发布到哪个 tag(须已存在或随本次创建)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CORE_TAG: "v0.1.11"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust iOS targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Clone patched core ($CORE_TAG + iOS cfg 放宽)
+        run: |
+          # core 以 git+tag 钉版;rc-capture 的 CVPixelBuffer 变体在 macos-only cfg 后,
+          # iOS 编译需要放宽(上游 PR TokenBoom/rabbitcontrol-core#2,未合并前在此打补丁)。
+          git clone --depth 1 --branch "$CORE_TAG" \
+            https://github.com/TokenBoom/rabbitcontrol-core.git "$RUNNER_TEMP/core"
+          cd "$RUNNER_TEMP/core"
+          sed -i '' 's/#\[cfg(target_os = "macos")\]/#[cfg(any(target_os = "macos", target_os = "ios"))]/' crates/rc-capture/src/lib.rs
+          grep -c 'target_os = "ios"' crates/rc-capture/src/lib.rs
+
+      - name: Write cargo patch config
+        run: |
+          mkdir -p .cargo
+          {
+            echo '[patch."https://github.com/TokenBoom/rabbitcontrol-core.git"]'
+            for c in rc-types rc-diff rc-sched rc-fec rc-proto rc-trace rc-loopback rc-capture rc-encode rc-decode rc-render rc-pipeline rc-audio rc-net rc-input rc-session rc-tools rc-client-core; do
+              echo "$c = { path = \"$RUNNER_TEMP/core/crates/$c\" }"
+            done
+          } > .cargo/config.toml
+          cat .cargo/config.toml
+
+      - name: Build xcframework
+        run: ./scripts/build-xcframework.sh build
+
+      - name: Package
+        run: |
+          cd build
+          tar -czf RabbitControlCore.xcframework.tar.gz RabbitControlCore.xcframework
+          shasum -a 256 RabbitControlCore.xcframework.tar.gz
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [ "$TAG" = "main" ] || [ -z "$TAG" ]; then TAG="${{ inputs.release_tag }}"; fi
+          gh release create "$TAG" --title "$TAG" --notes "预编译 RabbitControlCore.xcframework(core $CORE_TAG)" 2>/dev/null || true
+          gh release upload "$TAG" build/RabbitControlCore.xcframework.tar.gz --clobber
