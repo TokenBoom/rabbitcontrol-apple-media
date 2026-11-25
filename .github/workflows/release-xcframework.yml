@@ -40,7 +40,7 @@ jobs:
         run: |
           # core 版本以 Cargo.toml 钉的 tag 为准;iOS 适配补丁在 patches/core-ios-cfg.patch
           # (rc-capture CVPixelBuffer 的 iOS cfg 放宽;信令/中继 EINPROGRESS 已合入 core v0.1.14)。
-          CORE_TAG=$(grep -m1 'tag = ' Cargo.toml | sed 's/.*tag = "\(.*\)"/\1/')
+          CORE_TAG=$(grep -m1 'tag = ' Cargo.toml | sed -n 's/.*tag = "\([^"]*\)".*/\1/p')
           echo "core tag: $CORE_TAG"
           git clone --depth 1 --branch "$CORE_TAG" \
             https://github.com/TokenBoom/rabbitcontrol-core.git "$RUNNER_TEMP/core"
