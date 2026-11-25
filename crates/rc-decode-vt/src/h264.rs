@@ -18,12 +18,15 @@
 //! 编码侧的对照实现在 `rc-encode-vt/src/annexb.rs`（方向相反：
 //! AVCC → Annex-B）；两个模块刻意不共享代码，各自保持独立可测。
 
+use std::ops::Range;
+
 /// Annex-B 起始码（4 字节形式）。生产路径按字节逐位判定
 /// （[`start_code_len_at`]），本常量只被单测用于拼流。
 #[cfg_attr(not(test), allow(dead_code))]
 const ANNEXB_START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 
 /// `pos` 处是否是 Annex-B 起始码；是则返回其长度（4 或 3 字节形式）。
+#[inline]
 fn start_code_len_at(buf: &[u8], pos: usize) -> Option<usize> {
     let rest = buf.get(pos..)?;
     if rest.len() >= 4 && rest[0] == 0 && rest[1] == 0 && rest[2] == 0 && rest[3] == 1 {
@@ -35,62 +38,104 @@ fn start_code_len_at(buf: &[u8], pos: usize) -> Option<usize> {
     }
 }
 
+/// 8 字节 SWAR 零字节探测快速定位下一个 Annex-B 起始码（`00 00 01` 或 `00 00 00 01`）。
+#[inline]
+pub(crate) fn find_next_start_code_swar(buf: &[u8], mut pos: usize) -> usize {
+    let len = buf.len();
+    while pos + 3 <= len {
+        // 只要 8 字节内不含任何 0x00，则整块 8 字节都不可能是起始码起点。
+        while pos + 8 <= len {
+            let word = u64::from_ne_bytes([
+                buf[pos],
+                buf[pos + 1],
+                buf[pos + 2],
+                buf[pos + 3],
+                buf[pos + 4],
+                buf[pos + 5],
+                buf[pos + 6],
+                buf[pos + 7],
+            ]);
+            let has_zero =
+                (word.wrapping_sub(0x0101_0101_0101_0101)) & !word & 0x8080_8080_8080_8080;
+            if has_zero == 0 {
+                pos += 8;
+            } else {
+                break;
+            }
+        }
+        if pos + 3 > len {
+            return len;
+        }
+        if buf[pos] == 0 && buf[pos + 1] == 0 {
+            if buf[pos + 2] == 1 {
+                return pos;
+            }
+            if pos + 3 < len && buf[pos + 2] == 0 && buf[pos + 3] == 1 {
+                return pos;
+            }
+        }
+        pos += 1;
+    }
+    len
+}
+
 /// NAL 头字节的低 5 位 = nal_unit_type（H.264 Annex 表 7-1）。
+#[inline]
 const fn nal_unit_type(header: u8) -> u8 {
     header & 0x1f
 }
 
-/// 严格切分 Annex-B 流：返回 `(nal_unit_type, 载荷)` 序列。
+/// 零堆分配严格切分 Annex-B 流，把 `(nal_unit_type, 载荷范围)` 写入可复用的 `out` 缓冲。
 ///
-/// 载荷不含起始码、含 NAL 头字节。与编码侧宽松的 `nal_payloads` 不同，
-/// 这里是**解码入口的守门人**，结构性错误一律拒绝（返回 `None`）：
-/// - 空输入；
-/// - 不以起始码开头（含 AVCC 形态的长度前缀输入——封装不符应在上游被
-///   `bitstream_format` 校验拦下，混进来的在这里现形）；
-/// - 起始码后没有任何字节（空 NAL）。
-pub(crate) fn split_nals(input: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+/// 守门语义与 [`split_nals`] 完全一致：空输入、不以起始码开头、空 NAL 一律返回 `None`。
+pub(crate) fn split_nals_into(input: &[u8], out: &mut Vec<(u8, Range<usize>)>) -> Option<()> {
+    out.clear();
     if input.is_empty() {
         return None;
     }
-    let mut out = Vec::with_capacity(4);
     let mut pos = 0;
     while pos < input.len() {
-        // 不以起始码开头（首字节起就不匹配）→ 整体拒绝。
         let code_len = start_code_len_at(input, pos)?;
         let payload_start = pos + code_len;
         if payload_start >= input.len() {
-            // 起始码后没有任何字节：不是合法 NAL 序列。
             return None;
         }
-        // 载荷延伸到下一个起始码（或流尾）；任意起始码仅含 0x00/0x01，
-        // 故 `input[next + 2] > 1` 时可安全跳过 3 字节。
-        let mut next = payload_start;
-        while next < input.len() {
-            if next + 2 < input.len() && input[next + 2] > 1 {
-                next += 3;
-                continue;
-            }
-            if start_code_len_at(input, next).is_some() {
-                break;
-            }
-            next += 1;
-        }
-        let payload = input.get(payload_start..next)?;
-        if payload.is_empty() {
-            // 紧邻的起始码（载荷起点即是下一个起始码）：空 NAL，拒绝。
+        let next = find_next_start_code_swar(input, payload_start);
+        if next <= payload_start {
             return None;
         }
-        out.push((nal_unit_type(payload[0]), payload));
-        // next >= payload_start + 1 > pos：必然前进，无死循环。
+        out.push((nal_unit_type(input[payload_start]), payload_start..next));
         pos = next;
     }
-    Some(out)
+    Some(())
+}
+
+/// 严格切分 Annex-B 流：返回 `(nal_unit_type, 载荷)` 序列（主要供单测使用）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn split_nals(input: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    let mut ranges = Vec::with_capacity(4);
+    split_nals_into(input, &mut ranges)?;
+    Some(ranges.into_iter().map(|(t, r)| (t, &input[r])).collect())
+}
+
+/// 从零拷贝范围表里取第一组参数集：`(SPS, PPS)`（载荷含 NAL 头字节）。
+pub(crate) fn parameter_sets_from_ranges<'a>(
+    input: &'a [u8],
+    nals: &[(u8, Range<usize>)],
+) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    let sps = nals
+        .iter()
+        .find(|(t, _)| *t == 7)
+        .map(|(_, r)| &input[r.clone()]);
+    let pps = nals
+        .iter()
+        .find(|(t, _)| *t == 8)
+        .map(|(_, r)| &input[r.clone()]);
+    (sps, pps)
 }
 
 /// 从 NAL 序列里取第一组参数集：`(SPS, PPS)`（载荷含 NAL 头字节）。
-///
-/// 返回 `(None, _)` / `(_, None)` 表示缺 SPS / 缺 PPS——没有参数集就
-/// 无法构建 `CMVideoFormatDescription`，解码会话无从建立。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parameter_sets<'a>(
     nals: &'a [(u8, &'a [u8])],
 ) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
@@ -105,8 +150,44 @@ pub(crate) fn parameter_sets<'a>(
     (sps, pps)
 }
 
-/// 将已切分的 NAL 序列转为 4 字节大端长度前缀 AVCC，并**剥离参数集**（SPS=7 / PPS=8），
-/// 直接写入调用方提供的可复用缓冲 `out`（避免二次切分扫描与每帧堆分配）。
+/// 将范围表中的 NAL 转为 4 字节大端长度前缀 AVCC，并**剥离参数集**（SPS=7 / PPS=8），
+/// 直接写入调用方提供的可复用缓冲 `out`（零中间 Vec 分配）。
+pub(crate) fn nals_ranges_to_avcc_into(
+    input: &[u8],
+    nals: &[(u8, Range<usize>)],
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    out.clear();
+    let mut total_bytes = 0usize;
+    let mut slice_count = 0usize;
+    for (nal_type, range) in nals {
+        if *nal_type == 7 || *nal_type == 8 {
+            continue;
+        }
+        let len = range.len();
+        if len > u32::MAX as usize {
+            return None;
+        }
+        slice_count += 1;
+        total_bytes = total_bytes.checked_add(4)?.checked_add(len)?;
+    }
+    if slice_count == 0 {
+        return None;
+    }
+    out.reserve(total_bytes);
+    for (nal_type, range) in nals {
+        if *nal_type == 7 || *nal_type == 8 {
+            continue;
+        }
+        let payload = &input[range.clone()];
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+    Some(())
+}
+
+/// 将已切分的 NAL 序列转为 4 字节大端长度前缀 AVCC，并**剥离参数集**（SPS=7 / PPS=8）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn nals_to_avcc_into(nals: &[(u8, &[u8])], out: &mut Vec<u8>) -> Option<()> {
     out.clear();
     let mut total_bytes = 0usize;
@@ -445,6 +526,20 @@ mod tests {
         let nals2 = split_nals(&p_stream).unwrap();
         assert!(nals_to_avcc_into(&nals2, &mut scratch).is_some());
         assert_eq!(scratch, to_avcc_without_parameter_sets(&p_stream).unwrap());
+
+        // 零分配范围版与切片版逐字节等价，且覆盖长载荷跨 8 字节 SWAR 边界。
+        let long_idr = annexb(&[
+            nal(0x67, &[1; 19]),
+            nal(0x68, &[2; 7]),
+            nal(0x65, &[0xAB; 65]),
+        ]);
+        let mut ranges = Vec::new();
+        assert!(split_nals_into(&long_idr, &mut ranges).is_some());
+        let (s, p) = parameter_sets_from_ranges(&long_idr, &ranges);
+        assert_eq!(s.unwrap().len(), 20);
+        assert_eq!(p.unwrap().len(), 8);
+        assert!(nals_ranges_to_avcc_into(&long_idr, &ranges, &mut scratch).is_some());
+        assert_eq!(scratch, to_avcc_without_parameter_sets(&long_idr).unwrap());
     }
 
     // —— SPS 尺寸解析的测试用具：手工按位构造 SPS ——

@@ -33,10 +33,11 @@
 // 见模块文档：本模块是 crate 内唯一允许 unsafe 的地方。
 #![allow(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2_core_foundation::{CFBoolean, CFRetained, CFString};
@@ -55,6 +56,12 @@ pub(crate) type OSStatus = i32;
 
 /// `kVTPropertyNotSupportedErr`（VTErrors.h）：属性被当前解码器拒绝。
 const K_VT_PROPERTY_NOT_SUPPORTED_ERR: OSStatus = -12900;
+/// `kVTDecodeFrame_EnableAsynchronousDecompression`（VTErrors.h：`1 << 0`）。
+const K_VT_DECODE_FRAME_ENABLE_ASYNC: u32 = 1 << 0;
+/// `kVTDecodeInfo_Asynchronous`（VTErrors.h：`1 << 0`）。
+const K_VT_DECODE_INFO_ASYNCHRONOUS: u32 = 1 << 0;
+/// 异步流水线解码最大在途帧数（严格遵守铁律 1：≤ 2）。
+pub(crate) const MAX_PIPELINED_IN_FLIGHT: usize = 2;
 
 /// `kCMTimeInvalid`：flags 为空（不含 Valid）即非数值时间。
 const CMTIME_INVALID: CMTime = CMTime {
@@ -202,8 +209,24 @@ struct CallbackPayload {
 // 全局可用），CVPixelBuffer 本身在解出后不做任何并发可变访问。
 unsafe impl Send for CallbackPayload {}
 
-/// VT 解码输出回调。运行在 VideoToolbox 内部队列上：只 retain + 按帧号
-/// 投递邮箱，绝不做重活、绝不 panic（跨 C 边界 unwind 是未定义行为）。
+/// 回调共享上下文：区分同步快路径（`source_frame_refcon == 0`，免 Condvar 唤醒与 VecDeque 扫描）
+/// 与异步流水线路径（`source_frame_refcon != 0`，投递至帧序邮箱）。
+struct CallbackContext {
+    sync_slot: Mutex<Option<CallbackPayload>>,
+    mailbox: FrameMailbox<CallbackPayload>,
+}
+
+impl CallbackContext {
+    fn new() -> Self {
+        Self {
+            sync_slot: Mutex::new(None),
+            mailbox: FrameMailbox::new(),
+        }
+    }
+}
+
+/// VT 解码输出回调。运行在 VideoToolbox 内部队列或同步调用栈上：只 retain + 投递，
+/// 绝不做重活、绝不 panic（跨 C 边界 unwind 是未定义行为）。
 unsafe extern "C" fn vt_decode_callback(
     decompression_output_refcon: *mut c_void,
     source_frame_refcon: *mut c_void,
@@ -213,20 +236,24 @@ unsafe extern "C" fn vt_decode_callback(
     _presentation_time_stamp: CMTime,
     _presentation_duration: CMTime,
 ) {
-    // SAFETY: refcon 是 Create 时传入的 `Arc::as_ptr(&mailbox)`，指向
-    // DecompressionSession.mailbox 的堆内层分配。存活期由 Drop 顺序保证：
+    // SAFETY: refcon 是 Create 时传入的 `Arc::as_ptr(&cb_ctx)`，指向
+    // DecompressionSession.cb_ctx 的堆内层分配。存活期由 Drop 顺序保证：
     // WaitForAsynchronousFrames（等在途回调）+ Invalidate（不再有新回调）
-    // + 邮箱锁屏障（等正在执行的回调离开临界区）都先于 Arc 释放，
+    // + 锁屏障（等正在执行的回调离开临界区）都先于 Arc 释放，
     // 因此这里的解引用不可能悬垂。
-    let mailbox =
-        unsafe { &*(decompression_output_refcon as *const FrameMailbox<CallbackPayload>) };
-    // sourceFrameRefcon 原样带回提交时的帧号（lib.rs 保证单调唯一）。
-    let frame_id = source_frame_refcon as usize as u64;
+    let ctx = unsafe { &*(decompression_output_refcon as *const CallbackContext) };
     // SAFETY: NonNull::new 只做空指针检查；闭包里的 retain 依据回调契约——
-    // image_buffer 在回调期间有效，retain(+1) 升级为自有引用，随邮箱状态
-    // 移动/释放。
+    // image_buffer 在回调期间有效，retain(+1) 升级为自有引用，随状态移动/释放。
     let buffer = NonNull::new(image_buffer).map(|buf| unsafe { CFRetained::retain(buf) });
-    mailbox.post(frame_id, CallbackPayload { status, buffer });
+    let payload = CallbackPayload { status, buffer };
+    if source_frame_refcon.is_null() {
+        let mut slot = ctx.sync_slot.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(payload);
+    } else {
+        // sourceFrameRefcon 原样带回提交时的非零帧号。
+        let frame_id = source_frame_refcon as usize as u64;
+        ctx.mailbox.post(frame_id, payload);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -265,11 +292,27 @@ impl fmt::Display for DecodeFailure {
     }
 }
 
+/// 异步流水线单帧提交元数据。
+pub(crate) struct InFlightDecode {
+    pub submit_id: u64,
+    pub token: u64,
+    pub content_is_idr: bool,
+    pub started: Instant,
+}
+
+/// 异步流水线单帧回收结果。
+pub(crate) struct PipelinedDecodeOutput {
+    pub token: u64,
+    pub content_is_idr: bool,
+    pub elapsed: Duration,
+    pub result: Result<DecodeOutput, DecodeFailure>,
+}
+
 /// 一个配置好的 `VTDecompressionSession`。
 ///
 /// `Send`：随 `VtDecoder`（`Decoder: Send`）跨线程**移交所有权**；所有
-/// 访问都发生在持有 `&mut self` 的单一线程上，回调线程只经邮箱
-/// （已声明 Send + Sync）触碰数据。
+/// 访问都发生在持有 `&mut self` 的单一线程上，回调线程只经 `cb_ctx`
+/// 触碰数据。
 pub(crate) struct DecompressionSession {
     /// +1 的会话引用（VTDecompressionSessionCreate 返回）。Drop 前必须先
     /// Invalidate（Apple 文档要求），见 [`DecompressionSession::drop`]。
@@ -277,12 +320,14 @@ pub(crate) struct DecompressionSession {
     /// 会话的格式描述（SPS/PPS 构建时的 +1 引用）。每个样本都引用它；
     /// CMSampleBuffer 会自行 retain，这里是会话级的兜底所有权。
     _format_description: CFRetained<CMFormatDescription>,
-    /// 回调邮箱（refcon 指向其堆内层分配）。必须排在 session 之后：
+    /// 回调共享上下文（refcon 指向其堆内层分配）。必须排在 session 之后：
     /// 字段按声明顺序释放，Arc 在 Drop 手动 CFRelease(session) 与锁屏障
     /// 之后才 drop。
-    mailbox: Arc<FrameMailbox<CallbackPayload>>,
+    cb_ctx: Arc<CallbackContext>,
+    /// 异步流水线在途元数据队列（容量 ≤ `MAX_PIPELINED_IN_FLIGHT = 2`）。
+    in_flight: VecDeque<InFlightDecode>,
     /// 上一帧输出缓冲的保活引用：零拷贝句柄（[`DecodeOutput::ptr`]）交出去
-    /// 之后由这里 hold 引用计数，直到**下一次 decode_frame 替换或会话销毁**
+    /// 之后由这里 hold 引用计数，直到**下一次 decode_frame / recv_decoded_frame 替换或会话销毁**
     /// ——与 `FrameTexture` 文档「GPU 句柄在下一次采集前有效」的语义对称。
     /// 调用方（渲染器）要跨帧持有必须自行 retain。
     last_output: Option<CFRetained<CVPixelBuffer>>,
@@ -398,16 +443,16 @@ impl DecompressionSession {
     fn from_format_description(desc: CFRetained<CMFormatDescription>) -> Result<Self, String> {
         // 2. 建解码会话。decoder_specification / image_buffer_attributes 传
         //    null：系统默认解码器（优先硬件、软件兜底，见模块文档的选择理由）；
-        //    输出格式由解码器原生决定（NV12），对零拷贝渲染最友好。
-        let mailbox = Arc::new(FrameMailbox::new());
+        //    输出格式由解码器原生决定（NV12 IOSurface），对零拷贝渲染最友好。
+        let cb_ctx = Arc::new(CallbackContext::new());
         let callback_record = VtDecompressionOutputCallbackRecord {
             callback: vt_decode_callback,
-            refcon: Arc::as_ptr(&mailbox) as *mut c_void,
+            refcon: Arc::as_ptr(&cb_ctx) as *mut c_void,
         };
         let mut session_out: *mut c_void = std::ptr::null_mut();
         // SAFETY: desc 是刚建的合法视频格式描述；两个可空参数传 null = 系统
         // 默认；callback record 指向栈上存活的合法结构（Create 按值拷贝其
-        // 内容）；session_out 是本栈帧合法出参；refcon 指向 mailbox 的稳定
+        // 内容）；session_out 是本栈帧合法出参；refcon 指向 cb_ctx 的稳定
         // 堆分配（由会话持有 Arc 克隆保活，见 Drop 顺序）。
         let status = unsafe {
             raw::VTDecompressionSessionCreate(
@@ -433,7 +478,8 @@ impl DecompressionSession {
         let created = Self {
             session,
             _format_description: desc,
-            mailbox,
+            cb_ctx,
+            in_flight: VecDeque::with_capacity(MAX_PIPELINED_IN_FLIGHT),
             last_output: None,
             mailbox_dirty: false,
         };
@@ -467,43 +513,19 @@ impl DecompressionSession {
         Ok(created)
     }
 
-    /// 解码一帧：AVCC 装帧 → 提交（带帧号）→ 邮箱上等到**该帧**的回调。
-    ///
-    /// - 输入是 4 字节长度前缀的 AVCC（参数集已剥离，转换在纯逻辑层完成）；
-    /// - `frame_id`：单调帧号，经 `sourceFrameRefcon` 原样带回回调，
-    ///   邮箱按号取件（D5：严格单帧在途 + 号匹配 → 输出顺序 == 输入顺序）；
-    /// - `wait`：墙钟等待上限（由注入时间域的 deadline 换算，E 系超时语义），
-    ///   到点回调未到达返回 [`DecodeFailure::Timeout`]（迟到回调的输出留在
-    ///   邮箱里，下一次调用开头被 clear 丢弃——与编码侧「迟到输出丢弃」对称）；
-    /// - 输出零拷贝：不 LockBaseAddress、不做任何 CPU 回读（D1）。
-    pub(crate) fn decode_frame(
-        &mut self,
+    fn build_sample_buffer(
+        &self,
         avcc: &[u8],
-        frame_id: u64,
-        wait: Duration,
-    ) -> Result<DecodeOutput, DecodeFailure> {
-        // 解码提交/等待按 USER_INTERACTIVE 调度（回调队列 QoS 继承提交线程）。
-        promote_thread_qos_once();
-        // 仅当上一帧超时或提交异常退出时才清邮箱残留（常规帧路径跳过多余 Mutex 锁）。
-        if self.mailbox_dirty {
-            self.mailbox.clear();
-            self.mailbox_dirty = false;
-        }
-
-        // 1. AVCC → CMBlockBuffer。
-        // 坑（与编码侧 E6 相同）：blockAllocator 传 NULL 是「默认分配器」，
-        // CMBlockBuffer 释放时会用 free() 释放我们传入的内存块（真机上实测
-        // 为双重释放 → SIGABRT）。必须传 kCFAllocatorNull（「不释放」语义），
-        // 数据由 AlwaysCopyDataFlag 拷贝进 CM 自有内存，avcc 的生命周期从此
-        // 与块缓冲无关。
+        pts_frame_id: u64,
+    ) -> Result<CFRetained<CMSampleBuffer>, DecodeFailure> {
+        // 1. AVCC → CMBlockBuffer（kCFAllocatorNull + AlwaysCopyDataFlag）。
         // SAFETY: 只读 extern static 常量（框架加载时初始化、永不释放）。
         let null_allocator = unsafe { objc2_core_foundation::kCFAllocatorNull }
             .ok_or_else(|| DecodeFailure::Failed("kCFAllocatorNull 常量缺失".to_string()))?;
         let mut block_out: *mut CMBlockBuffer = std::ptr::null_mut();
         // SAFETY: memory_block 指向 avcc（同步调用期间存活），Null 分配器承诺
         // CMBlockBuffer 释放时不动它；AlwaysCopyDataFlag 让 CoreMedia 把字节
-        // 拷进自有内存；structure_allocator 用系统默认；custom_block_source
-        // 为 null（无自定义释放回调）；block_out 是本栈帧的合法出参。
+        // 拷进自有内存，avcc 生命周期从此独立（安全支持异步流水线）。
         let status = unsafe {
             CMBlockBuffer::create_with_memory_block(
                 None,
@@ -525,22 +547,19 @@ impl DecompressionSession {
         // SAFETY: 上面已判空；Create 成功时 block_out 是 +1 所有权引用。
         let block = unsafe { CFRetained::from_raw(NonNull::new_unchecked(block_out)) };
 
-        // 2. CMSampleBuffer（1 个样本 + 1 条 timing；尺寸表允许缺省）。
-        //    PTS 严格单调（帧号 × 10 / 600），DTS 无效——无 B 帧流不需要。
+        // 2. CMSampleBuffer（1 个样本 + 1 条单调 PTS timing；无 B 帧不设 DTS）。
         let timing = [CMSampleTimingInfo {
             duration: CMTIME_INVALID,
             presentationTimeStamp: CMTime {
                 epoch: 0,
                 flags: CMTimeFlags::Valid,
-                value: (frame_id as i64).saturating_mul(10),
+                value: (pts_frame_id as i64).saturating_mul(10),
                 timescale: 600,
             },
             decodeTimeStamp: CMTIME_INVALID,
         }];
         let mut sample_out: *mut CMSampleBuffer = std::ptr::null_mut();
-        // SAFETY: block 是自有引用；desc 经格式描述在会话内保活（CMSampleBuffer
-        // 亦自行 retain）；timing 指向栈数组；sample_size_array 为 null 且对应
-        // entries=0（尺寸未知，对解码合法）；sample_out 是本栈帧的合法出参。
+        // SAFETY: block/desc 是自有引用；timing 指向栈数组；sample_out 是本栈帧合法出参。
         let status = unsafe {
             CMSampleBuffer::create_ready(
                 None,
@@ -560,18 +579,80 @@ impl DecompressionSession {
             )));
         }
         // SAFETY: 上面已判空；Create 成功时 sample_out 是 +1 所有权引用。
-        let sample = unsafe { CFRetained::from_raw(NonNull::new_unchecked(sample_out)) };
+        Ok(unsafe { CFRetained::from_raw(NonNull::new_unchecked(sample_out)) })
+    }
 
-        // 3. 提交（decodeFlags = 0：回调恰在本帧到达一次；refcon = 帧号）。
+    fn finish_payload(
+        &mut self,
+        frame_id: u64,
+        payload: CallbackPayload,
+    ) -> Result<DecodeOutput, DecodeFailure> {
+        if payload.status != 0 {
+            return Err(DecodeFailure::Callback(format!(
+                "解码回调携带错误状态: OSStatus {}（帧 {}）",
+                payload.status, frame_id
+            )));
+        }
+        let Some(buffer) = payload.buffer else {
+            return Err(DecodeFailure::Callback(format!(
+                "解码回调成功但没有交出输出帧（帧 {frame_id}，码流可能损坏）"
+            )));
+        };
+        let width = CVPixelBufferGetWidth(&buffer) as u32;
+        let height = CVPixelBufferGetHeight(&buffer) as u32;
+        // SAFETY: as_ptr 借用不转移所有权；句柄交给调用方，存活期由
+        // last_output 的引用计数保证（下一次 decode/recv_decoded 前有效）。
+        let ptr = CFRetained::as_ptr(&buffer).as_ptr().cast::<c_void>();
+        self.last_output = Some(buffer);
+        Ok(DecodeOutput { ptr, width, height })
+    }
+
+    /// 等待所有在途异步帧结束并清空邮箱残留（flush / 会话切换 / 切回同步前调用）。
+    pub(crate) fn wait_and_clear(&mut self) {
+        if !self.in_flight.is_empty() || self.mailbox_dirty {
+            // SAFETY: session 有效，等待全部在途异步回调完成。
+            unsafe {
+                raw::VTDecompressionSessionWaitForAsynchronousFrames(self.session.as_ptr());
+            }
+            self.in_flight.clear();
+            self.cb_ctx.mailbox.clear();
+            self.cb_ctx
+                .sync_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            self.mailbox_dirty = false;
+        }
+    }
+
+    /// 当前异步流水线在途帧数（`0..=2`）。
+    pub(crate) fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// 同步解码一帧：优先走 `decodeFlags = 0` 同步内联快路径（免 Condvar 唤醒与 VecDeque 扫描）；
+    /// 仅当 VT 意外走异步分支时回退至帧序邮箱有界等待。
+    pub(crate) fn decode_frame(
+        &mut self,
+        avcc: &[u8],
+        frame_id: u64,
+        wait: Duration,
+    ) -> Result<DecodeOutput, DecodeFailure> {
+        promote_thread_qos_once();
+        if !self.in_flight.is_empty() || self.mailbox_dirty {
+            self.wait_and_clear();
+        }
+        let sample = self.build_sample_buffer(avcc, frame_id)?;
+
+        // 同步路径传 source_frame_refcon = null，回调写入 sync_slot（无 Condvar 唤醒）。
         let mut info_flags: u32 = 0;
-        // SAFETY: 会话由本包装拥有；sample 是自有引用；info_flags 是合法出参；
-        // refcon 只是一个透传的整数帧号（回调里重解释回 u64）。
+        // SAFETY: 会话与 sample 有效，info_flags 为合法出参，null refcon 走 sync_slot。
         let status = unsafe {
             raw::VTDecompressionSessionDecodeFrame(
                 self.session.as_ptr(),
                 CFRetained::as_ptr(&sample).as_ptr().cast::<c_void>(),
                 0,
-                frame_id as usize as *mut c_void,
+                std::ptr::null_mut(),
                 std::ptr::addr_of_mut!(info_flags),
             )
         };
@@ -581,34 +662,115 @@ impl DecompressionSession {
             )));
         }
 
-        // 4. 邮箱上等本帧回调（有界等待，绝不无限阻塞）。
-        let deadline = Instant::now()
-            .checked_add(wait)
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(1));
-        let Some(payload) = self.mailbox.take(frame_id, deadline) else {
-            self.mailbox_dirty = true;
-            return Err(DecodeFailure::Timeout);
-        };
-        if payload.status != 0 {
-            return Err(DecodeFailure::Callback(format!(
-                "解码回调携带错误状态: OSStatus {}（帧 {}）",
-                payload.status, frame_id
+        // Apple Silicon 真机实证 decodeFlags = 0 时回调 100% 同步内联完成。
+        let inline_payload = self
+            .cb_ctx
+            .sync_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(payload) = inline_payload {
+            return self.finish_payload(frame_id, payload);
+        }
+
+        // 防御性兜底：若驱动仍返回异步标记，等待帧完成后再读取 sync_slot。
+        if info_flags & K_VT_DECODE_INFO_ASYNCHRONOUS != 0 {
+            let deadline = Instant::now()
+                .checked_add(wait)
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(1));
+            // SAFETY: session 有效。
+            unsafe {
+                raw::VTDecompressionSessionWaitForAsynchronousFrames(self.session.as_ptr());
+            }
+            if Instant::now() >= deadline {
+                self.mailbox_dirty = true;
+                return Err(DecodeFailure::Timeout);
+            }
+            let fallback_payload = self
+                .cb_ctx
+                .sync_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(payload) = fallback_payload {
+                return self.finish_payload(frame_id, payload);
+            }
+        }
+        self.mailbox_dirty = true;
+        Err(DecodeFailure::Timeout)
+    }
+
+    /// 2-deep 异步提交一帧（`kVTDecodeFrame_EnableAsynchronousDecompression`，非阻塞）。
+    pub(crate) fn submit_decode_frame(
+        &mut self,
+        avcc: &[u8],
+        submit_id: u64,
+        token: u64,
+        content_is_idr: bool,
+    ) -> Result<(), DecodeFailure> {
+        if self.in_flight.len() >= MAX_PIPELINED_IN_FLIGHT {
+            return Err(DecodeFailure::Failed(format!(
+                "pipelined decode in_flight limit ({MAX_PIPELINED_IN_FLIGHT}) reached"
             )));
         }
-        // SAFETY: 回调里 retain 的 +1 自有引用，随邮箱移动到这里； getWidth/
-        // getHeight 是同步只读的安全包装（直接调用，无需 unsafe）。
-        let Some(buffer) = payload.buffer else {
-            return Err(DecodeFailure::Callback(format!(
-                "解码回调成功但没有交出输出帧（帧 {frame_id}，码流可能损坏）"
-            )));
+        promote_thread_qos_once();
+        if self.mailbox_dirty && self.in_flight.is_empty() {
+            self.cb_ctx.mailbox.clear();
+            self.mailbox_dirty = false;
+        }
+        // 非零 refcon 确保回调路由到异步 mailbox（0 保留给同步快路径）。
+        let refcon_id = submit_id.max(1);
+        let sample = self.build_sample_buffer(avcc, refcon_id)?;
+        let started = Instant::now();
+        let mut info_flags: u32 = 0;
+        // SAFETY: 会话与 sample 有效；AlwaysCopyDataFlag 保证 sample 自持码流内存；
+        // refcon_id 为非零帧号（回调只按整数读取，不解引用）。
+        let status = unsafe {
+            raw::VTDecompressionSessionDecodeFrame(
+                self.session.as_ptr(),
+                CFRetained::as_ptr(&sample).as_ptr().cast::<c_void>(),
+                K_VT_DECODE_FRAME_ENABLE_ASYNC,
+                refcon_id as usize as *mut c_void,
+                std::ptr::addr_of_mut!(info_flags),
+            )
         };
-        let width = CVPixelBufferGetWidth(&buffer) as u32;
-        let height = CVPixelBufferGetHeight(&buffer) as u32;
-        // SAFETY: as_ptr 借用不转移所有权；句柄交给调用方，存活期由
-        // last_output 的引用计数保证（见字段注释）。
-        let ptr = CFRetained::as_ptr(&buffer).as_ptr().cast::<c_void>();
-        self.last_output = Some(buffer);
-        Ok(DecodeOutput { ptr, width, height })
+        if status != 0 {
+            return Err(DecodeFailure::Failed(format!(
+                "VTDecompressionSessionDecodeFrame(async) 失败: OSStatus {status}"
+            )));
+        }
+        self.in_flight.push_back(InFlightDecode {
+            submit_id: refcon_id,
+            token,
+            content_is_idr,
+            started,
+        });
+        Ok(())
+    }
+
+    /// 按 FIFO 提交顺序回收下一帧异步解码结果；超时无就绪返回 `None`。
+    pub(crate) fn recv_decoded_frame(
+        &mut self,
+        timeout: Duration,
+    ) -> Option<PipelinedDecodeOutput> {
+        let front_id = self.in_flight.front()?.submit_id;
+        let deadline = if timeout.is_zero() {
+            Instant::now()
+        } else {
+            Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(1))
+        };
+        let payload = self.cb_ctx.mailbox.take(front_id, deadline)?;
+        let meta = self.in_flight.pop_front()?;
+        let elapsed = meta.started.elapsed();
+        let result = self.finish_payload(meta.submit_id, payload);
+        Some(PipelinedDecodeOutput {
+            token: meta.token,
+            content_is_idr: meta.content_is_idr,
+            elapsed,
+            result,
+        })
     }
 }
 
@@ -617,14 +779,19 @@ impl Drop for DecompressionSession {
         // SAFETY: session 是 Create 返回的 +1 引用。顺序：
         // 1. WaitForAsynchronousFrames：等在途回调执行完；
         // 2. Invalidate：返回后不再有新回调；
-        // 3. 邮箱锁屏障：等正在执行的回调离开临界区，之后不会再有代码
-        //    触碰 refcon；
-        // 4. CFRelease 会话；随后字段按声明顺序释放（mailbox 的 Arc 最后）。
+        // 3. 锁屏障：等正在执行的回调离开临界区，之后不会再有代码触碰 refcon；
+        // 4. CFRelease 会话；随后字段按声明顺序释放（cb_ctx 的 Arc 最后）。
         unsafe {
             raw::VTDecompressionSessionWaitForAsynchronousFrames(self.session.as_ptr());
             raw::VTDecompressionSessionInvalidate(self.session.as_ptr());
-            self.mailbox.clear();
+            self.cb_ctx.mailbox.clear();
+            self.cb_ctx
+                .sync_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
             raw::CFRelease(self.session.as_ptr().cast_const());
         }
+        self.in_flight.clear();
     }
 }

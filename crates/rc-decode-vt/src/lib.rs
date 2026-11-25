@@ -163,23 +163,33 @@ impl VtDecoderConfig {
 mod platform {
     use super::{ffi, RefChainGate, VtDecoderConfig, ESTIMATED_DECODE_COST_US};
     use rc_capture::FrameTexture;
-    use rc_decode::{DecodeOutput, DecodedFrame, Decoder};
+    use rc_decode::{DecodeOutput, DecodeSubmitStatus, DecodedFrame, Decoder};
     use rc_encode::Codec;
     use rc_types::{Error, FrameKind, Result, Timestamp};
     use std::fmt;
+    use std::ops::Range;
     use std::time::{Duration, Instant};
 
-    /// VideoToolbox 硬件 H.264 解码器（实现 [`Decoder`](rc_decode::Decoder)）。
+    /// `prepare_frame` 结果：校验与 Annex-B→AVCC/HVCC 准备完成，或需要请求关键帧。
+    enum PrepareOutcome {
+        Ready { content_is_idr: bool },
+        NeedKeyframe,
+    }
+
+    /// VideoToolbox 硬件 H.264/HEVC 解码器（实现 [`Decoder`](rc_decode::Decoder)）。
     ///
     /// - 构造不碰 FFI：会话惰性建立（首个带 SPS/PPS 的 IDR），
     ///   [`VtDecoderConfig::validate`] 的失败在构造期暴露；
     /// - 输出 [`FrameTexture::CVPixelBuffer`] 零拷贝句柄（D1），存活期与
-    ///   采集侧句柄语义对称：**下一次 `decode` / 解码器销毁之前有效**，
+    ///   采集侧句柄语义对称：**下一次 `decode` / `recv_decoded` / 解码器销毁之前有效**，
     ///   渲染器要跨帧持有必须自行 retain；
-    /// - `flush` 恒空操作：进一出一（D5）的实现没有内部缓冲。
+    /// - 支持 2-deep 异步流水线解码（[`Decoder::submit_decode`] / [`Decoder::recv_decoded`]，
+    ///   严格遵守铁律 1 `in_flight ≤ 2`）。
     pub struct VtDecoder {
         cfg: VtDecoderConfig,
         gate: RefChainGate,
+        /// 异步流水线中是否存在已提交但尚未回调的 IDR（允许紧随其后的 P 帧进入第 2 槽）。
+        idr_in_flight: usize,
         /// 惰性建立的解码会话；参数集变化时重建。
         session: Option<ffi::DecompressionSession>,
         /// 当前会话对应的参数集键（H.264 为 SPS；HEVC 为 VPS||SPS||PPS，检测变化与分辨率切换）。
@@ -189,7 +199,9 @@ mod platform {
         /// 逻辑时钟（微秒，与 `Timestamp` 同为 u32 域）：最近一次实际解码
         /// 调用的完成时刻。
         clock_us: u32,
-        /// 可复用的 AVCC 拼装暂存区：避免每帧重复分配 `Vec<u8>`。
+        /// 可复用的 NAL 范围暂存区（避免每帧分配 `Vec<(u8, &[u8])>`）。
+        nals_scratch: Vec<(u8, Range<usize>)>,
+        /// 可复用的 AVCC/HVCC 拼装暂存区（避免每帧重复分配 `Vec<u8>`）。
         avcc_scratch: Vec<u8>,
     }
 
@@ -215,10 +227,12 @@ mod platform {
             Ok(VtDecoder {
                 cfg,
                 gate: RefChainGate::new(),
+                idr_in_flight: 0,
                 session: None,
                 session_params: None,
                 frame_id: 0,
                 clock_us: 0,
+                nals_scratch: Vec::with_capacity(8),
                 avcc_scratch: Vec::new(),
             })
         }
@@ -243,45 +257,119 @@ mod platform {
             kind: FrameKind,
             deadline_ts: Timestamp,
         ) -> Result<DecodeOutput> {
-            // 若调用方会话时间戳从高值回绕或被重置，归零逻辑时钟以防假超时。
-            if deadline_ts.0 < self.clock_us
-                && self.clock_us.wrapping_sub(deadline_ts.0) > u32::MAX / 2
-            {
-                self.clock_us = 0;
-            }
-
-            match self.cfg.codec {
-                Codec::H264 => self.decode_h264(data, kind, deadline_ts),
-                Codec::Hevc => self.decode_hevc(data, kind, deadline_ts),
-                other => Err(Error::InvalidConfig(format!(
-                    "rc-decode-vt 不支持解码器 {:?}",
-                    other
-                ))),
+            match self.prepare_frame(data, kind, deadline_ts, false)? {
+                PrepareOutcome::NeedKeyframe => Ok(DecodeOutput::NeedKeyframe),
+                PrepareOutcome::Ready { content_is_idr } => {
+                    self.finish_sync_decode(content_is_idr, deadline_ts)
+                }
             }
         }
 
         fn needs_keyframe(&self) -> bool {
-            // 参考链断裂（含「从未解出过 IDR」）即需要关键帧。
-            !self.gate.is_ok()
+            // 参考链断裂（且无在途 IDR 即将重建链）即需要关键帧。
+            !self.gate.is_ok() && self.idr_in_flight == 0
         }
 
         fn flush(&mut self) -> Result<()> {
-            // D5：进一出一的实现没有内部缓冲，无帧可冲刷。
+            if let Some(session) = self.session.as_mut() {
+                session.wait_and_clear();
+            }
+            self.idr_in_flight = 0;
             Ok(())
+        }
+
+        fn supports_pipelined_decode(&self) -> bool {
+            true
+        }
+
+        fn submit_decode(
+            &mut self,
+            token: u64,
+            data: &[u8],
+            kind: FrameKind,
+            deadline_ts: Timestamp,
+        ) -> Result<DecodeSubmitStatus> {
+            match self.prepare_frame(data, kind, deadline_ts, true)? {
+                PrepareOutcome::NeedKeyframe => Ok(DecodeSubmitStatus::NeedKeyframe),
+                PrepareOutcome::Ready { content_is_idr } => {
+                    let Some(session) = self.session.as_mut() else {
+                        return Ok(DecodeSubmitStatus::NeedKeyframe);
+                    };
+                    let submit_id = self
+                        .frame_id
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Decoder("会话帧号耗尽 u64".to_string()))?;
+                    session
+                        .submit_decode_frame(&self.avcc_scratch, submit_id, token, content_is_idr)
+                        .map_err(|e| Error::Decoder(e.to_string()))?;
+                    self.frame_id = submit_id;
+                    if content_is_idr {
+                        self.idr_in_flight += 1;
+                    }
+                    Ok(DecodeSubmitStatus::Submitted)
+                }
+            }
+        }
+
+        fn recv_decoded(&mut self, timeout: Duration) -> Result<Option<(u64, DecodeOutput)>> {
+            let Some(session) = self.session.as_mut() else {
+                return Ok(None);
+            };
+            let Some(item) = session.recv_decoded_frame(timeout) else {
+                return Ok(None);
+            };
+            if item.content_is_idr {
+                self.idr_in_flight = self.idr_in_flight.saturating_sub(1);
+            }
+            match item.result {
+                Ok(out) => {
+                    let done_ts = self.advance_clock(item.elapsed);
+                    if item.content_is_idr {
+                        self.gate.mark_idr_decoded();
+                    }
+                    Ok(Some((
+                        item.token,
+                        DecodeOutput::Frame(DecodedFrame {
+                            texture: FrameTexture::CVPixelBuffer(out.ptr),
+                            decode_done_ts: done_ts,
+                            width: out.width,
+                            height: out.height,
+                        }),
+                    )))
+                }
+                Err(ffi::DecodeFailure::Timeout) => {
+                    self.gate.break_chain();
+                    self.advance_clock(item.elapsed);
+                    Err(Error::Timeout(item.elapsed))
+                }
+                Err(ffi::DecodeFailure::Callback(_)) if !item.content_is_idr => {
+                    self.gate.break_chain();
+                    self.advance_clock(item.elapsed);
+                    Ok(Some((item.token, DecodeOutput::NeedKeyframe)))
+                }
+                Err(e) => {
+                    self.gate.break_chain();
+                    Err(Error::Decoder(e.to_string()))
+                }
+            }
+        }
+
+        fn in_flight_count(&self) -> usize {
+            self.session
+                .as_ref()
+                .map_or(0, ffi::DecompressionSession::in_flight_count)
         }
     }
 
     impl VtDecoder {
-        fn finish_decode(
+        fn finish_sync_decode(
             &mut self,
-            kind: FrameKind,
             content_is_idr: bool,
             deadline_ts: Timestamp,
         ) -> Result<DecodeOutput> {
             let Some(session) = self.session.as_mut() else {
                 return Ok(DecodeOutput::NeedKeyframe);
             };
-            let _ = kind;
             let frame_id = self.frame_id;
             self.frame_id = frame_id
                 .checked_add(1)
@@ -310,8 +398,6 @@ mod platform {
                     Err(Error::Timeout(elapsed))
                 }
                 Err(ffi::DecodeFailure::Callback(_)) if !content_is_idr => {
-                    // P 帧缺参考/损坏导致回调返回 bad-data（如 -12909）时不断死会话：
-                    // 断链并请求下一张 IDR 重建参考链（契约 D4）。
                     self.gate.break_chain();
                     self.advance_clock(started.elapsed());
                     Ok(DecodeOutput::NeedKeyframe)
@@ -323,13 +409,37 @@ mod platform {
             }
         }
 
-        fn decode_h264(
+        fn prepare_frame(
             &mut self,
             data: &[u8],
             kind: FrameKind,
             deadline_ts: Timestamp,
-        ) -> Result<DecodeOutput> {
-            let nals = crate::h264::split_nals(data).ok_or_else(|| {
+            pipelined: bool,
+        ) -> Result<PrepareOutcome> {
+            // 若调用方会话时间戳从高值回绕或被重置，归零逻辑时钟以防假超时。
+            if deadline_ts.0 < self.clock_us
+                && self.clock_us.wrapping_sub(deadline_ts.0) > u32::MAX / 2
+            {
+                self.clock_us = 0;
+            }
+            match self.cfg.codec {
+                Codec::H264 => self.prepare_h264(data, kind, deadline_ts, pipelined),
+                Codec::Hevc => self.prepare_hevc(data, kind, deadline_ts, pipelined),
+                other => Err(Error::InvalidConfig(format!(
+                    "rc-decode-vt 不支持解码器 {:?}",
+                    other
+                ))),
+            }
+        }
+
+        fn prepare_h264(
+            &mut self,
+            data: &[u8],
+            kind: FrameKind,
+            deadline_ts: Timestamp,
+            pipelined: bool,
+        ) -> Result<PrepareOutcome> {
+            crate::h264::split_nals_into(data, &mut self.nals_scratch).ok_or_else(|| {
                 Error::InvalidFrame(format!(
                     "rc-decode-vt: 码流不是合法 Annex-B（配置声明 bitstream_format={}）：{} 字节输入",
                     self.cfg.bitstream_format.as_str(),
@@ -337,7 +447,7 @@ mod platform {
                 ))
             })?;
 
-            let content_is_idr = nals.iter().any(|(t, _)| *t == 5);
+            let content_is_idr = self.nals_scratch.iter().any(|(t, _)| *t == 5);
             match (kind, content_is_idr) {
                 (FrameKind::Idr, false) => {
                     return Err(Error::InvalidFrame(
@@ -359,12 +469,13 @@ mod platform {
                 ))));
             }
 
-            if !self.gate.is_ok() && !content_is_idr {
-                return Ok(DecodeOutput::NeedKeyframe);
+            let chain_available = self.gate.is_ok() || (pipelined && self.idr_in_flight > 0);
+            if !chain_available && !content_is_idr {
+                return Ok(PrepareOutcome::NeedKeyframe);
             }
 
             if content_is_idr {
-                let (sps, pps) = crate::h264::parameter_sets(&nals);
+                let (sps, pps) = crate::h264::parameter_sets_from_ranges(data, &self.nals_scratch);
                 match (sps, pps) {
                     (Some(sps), Some(pps)) => {
                         let needs_rebuild = match self.session_params.as_deref() {
@@ -383,37 +494,48 @@ mod platform {
                                     )));
                                 }
                             }
+                            if let Some(old) = self.session.as_mut() {
+                                old.wait_and_clear();
+                            }
+                            self.idr_in_flight = 0;
                             self.session = Some(
                                 ffi::DecompressionSession::new(sps, pps).map_err(Error::Decoder)?,
                             );
                             self.session_params = Some(sps.to_vec());
                         }
                     }
-                    _ if self.session.is_none() => return Ok(DecodeOutput::NeedKeyframe),
+                    _ if self.session.is_none() => return Ok(PrepareOutcome::NeedKeyframe),
                     _ => {}
                 }
             }
 
             if self.session.is_none() {
-                return Ok(DecodeOutput::NeedKeyframe);
+                return Ok(PrepareOutcome::NeedKeyframe);
             }
 
-            if crate::h264::nals_to_avcc_into(&nals, &mut self.avcc_scratch).is_none() {
+            if crate::h264::nals_ranges_to_avcc_into(
+                data,
+                &self.nals_scratch,
+                &mut self.avcc_scratch,
+            )
+            .is_none()
+            {
                 return Err(Error::InvalidFrame(
                     "帧不含任何 slice NAL（无法解码出画面）".to_string(),
                 ));
             }
 
-            self.finish_decode(kind, content_is_idr, deadline_ts)
+            Ok(PrepareOutcome::Ready { content_is_idr })
         }
 
-        fn decode_hevc(
+        fn prepare_hevc(
             &mut self,
             data: &[u8],
             kind: FrameKind,
             deadline_ts: Timestamp,
-        ) -> Result<DecodeOutput> {
-            let nals = crate::h265::split_nals(data).ok_or_else(|| {
+            pipelined: bool,
+        ) -> Result<PrepareOutcome> {
+            crate::h265::split_nals_into(data, &mut self.nals_scratch).ok_or_else(|| {
                 Error::InvalidFrame(format!(
                     "rc-decode-vt: HEVC 码流不是合法 Annex-B（配置声明 bitstream_format={}）：{} 字节输入",
                     self.cfg.bitstream_format.as_str(),
@@ -421,7 +543,10 @@ mod platform {
                 ))
             })?;
 
-            let content_is_idr = nals.iter().any(|(t, _)| crate::h265::is_irap_nal(*t));
+            let content_is_idr = self
+                .nals_scratch
+                .iter()
+                .any(|(t, _)| crate::h265::is_irap_nal(*t));
             match (kind, content_is_idr) {
                 (FrameKind::Idr, false) => {
                     return Err(Error::InvalidFrame(
@@ -443,35 +568,33 @@ mod platform {
                 ))));
             }
 
-            if !self.gate.is_ok() && !content_is_idr {
-                return Ok(DecodeOutput::NeedKeyframe);
+            let chain_available = self.gate.is_ok() || (pipelined && self.idr_in_flight > 0);
+            if !chain_available && !content_is_idr {
+                return Ok(PrepareOutcome::NeedKeyframe);
             }
 
             if content_is_idr {
-                let params = crate::h265::parameter_sets(&nals);
+                let params = crate::h265::parameter_sets_from_ranges(data, &self.nals_scratch);
                 match (params.vps, params.sps, params.pps) {
                     (Some(vps), Some(sps), Some(pps)) => {
-                        let vps_len = u16::try_from(vps.len()).map_err(|_| {
-                            Error::InvalidFrame("HEVC VPS 长度超过 u16::MAX".to_string())
-                        })?;
-                        let sps_len = u16::try_from(sps.len()).map_err(|_| {
-                            Error::InvalidFrame("HEVC SPS 长度超过 u16::MAX".to_string())
-                        })?;
-                        let pps_len = u16::try_from(pps.len()).map_err(|_| {
-                            Error::InvalidFrame("HEVC PPS 长度超过 u16::MAX".to_string())
-                        })?;
-                        let mut key = Vec::with_capacity(vps.len() + sps.len() + pps.len() + 6);
-                        key.extend_from_slice(&vps_len.to_be_bytes());
-                        key.extend_from_slice(vps);
-                        key.extend_from_slice(&sps_len.to_be_bytes());
-                        key.extend_from_slice(sps);
-                        key.extend_from_slice(&pps_len.to_be_bytes());
-                        key.extend_from_slice(pps);
                         let needs_rebuild = match self.session_params.as_deref() {
-                            Some(cur) => cur != key.as_slice(),
+                            Some(cur) => !crate::h265::params_key_matches(cur, vps, sps, pps),
                             None => true,
                         };
                         if needs_rebuild {
+                            let vps_len = u16::try_from(vps.len()).map_err(|_| {
+                                Error::InvalidFrame("HEVC VPS 长度超过 u16::MAX".to_string())
+                            })?;
+                            let sps_len = u16::try_from(sps.len()).map_err(|_| {
+                                Error::InvalidFrame("HEVC SPS 长度超过 u16::MAX".to_string())
+                            })?;
+                            let pps_len = u16::try_from(pps.len()).map_err(|_| {
+                                Error::InvalidFrame("HEVC PPS 长度超过 u16::MAX".to_string())
+                            })?;
+                            if let Some(old) = self.session.as_mut() {
+                                old.wait_and_clear();
+                            }
+                            self.idr_in_flight = 0;
                             self.session = Some(
                                 ffi::DecompressionSession::new_hevc(
                                     vps,
@@ -485,25 +608,38 @@ mod platform {
                                     Err(frame_err) => Error::InvalidFrame(frame_err),
                                 })?,
                             );
+                            let mut key = Vec::with_capacity(vps.len() + sps.len() + pps.len() + 6);
+                            key.extend_from_slice(&vps_len.to_be_bytes());
+                            key.extend_from_slice(vps);
+                            key.extend_from_slice(&sps_len.to_be_bytes());
+                            key.extend_from_slice(sps);
+                            key.extend_from_slice(&pps_len.to_be_bytes());
+                            key.extend_from_slice(pps);
                             self.session_params = Some(key);
                         }
                     }
-                    _ if self.session.is_none() => return Ok(DecodeOutput::NeedKeyframe),
+                    _ if self.session.is_none() => return Ok(PrepareOutcome::NeedKeyframe),
                     _ => {}
                 }
             }
 
             if self.session.is_none() {
-                return Ok(DecodeOutput::NeedKeyframe);
+                return Ok(PrepareOutcome::NeedKeyframe);
             }
 
-            if crate::h265::nals_to_hvcc_into(&nals, &mut self.avcc_scratch).is_none() {
+            if crate::h265::nals_ranges_to_hvcc_into(
+                data,
+                &self.nals_scratch,
+                &mut self.avcc_scratch,
+            )
+            .is_none()
+            {
                 return Err(Error::InvalidFrame(
                     "HEVC 帧不含任何 slice NAL（无法解码出画面）".to_string(),
                 ));
             }
 
-            self.finish_decode(kind, content_is_idr, deadline_ts)
+            Ok(PrepareOutcome::Ready { content_is_idr })
         }
     }
 }
@@ -701,5 +837,22 @@ mod gates_no_gpu {
                 Timestamp(10_000_000)
             )
             .is_err());
+
+        // 2-deep 流水线解码门禁：支持流水线、未见 IDR 时 submit_decode 返回 NeedKeyframe。
+        assert!(dec.supports_pipelined_decode());
+        assert_eq!(dec.in_flight_count(), 0);
+        assert!(matches!(
+            dec.submit_decode(1, &hevc_p, FrameKind::P, Timestamp(10_000_000)),
+            Ok(rc_decode::DecodeSubmitStatus::NeedKeyframe)
+        ));
+        assert!(matches!(
+            dec.submit_decode(2, &hevc_idr, FrameKind::Idr, Timestamp(10_000_000)),
+            Ok(rc_decode::DecodeSubmitStatus::NeedKeyframe)
+        ));
+        assert_eq!(dec.in_flight_count(), 0);
+        assert!(dec
+            .recv_decoded(std::time::Duration::ZERO)
+            .expect("无在途帧返回 Ok(None)")
+            .is_none());
     }
 }
