@@ -47,6 +47,18 @@ jobs:
           cd "$RUNNER_TEMP/core"
           sed -i '' 's/#\[cfg(target_os = "macos")\]/#[cfg(any(target_os = "macos", target_os = "ios"))]/' crates/rc-capture/src/lib.rs
           grep -c 'target_os = "ios"' crates/rc-capture/src/lib.rs
+          # 信令非阻塞 connect 的 EINPROGRESS 分支同样需覆盖 iOS(上游 PR 流程中)
+          python3 - <<'PYINNER'
+          import re
+          sp = 'crates/rc-client-core/src/signal_client.rs'
+          s = open(sp).read()
+          s = s.replace('#[cfg(target_os = "macos")]\n        {\n            matches!(err.raw_os_error(), Some(36 | 37))',
+                        '#[cfg(any(target_os = "macos", target_os = "ios"))]\n        {\n            matches!(err.raw_os_error(), Some(36 | 37))')
+          s = s.replace('#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]',
+                        '#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux", windows)))]')
+          open(sp, 'w').write(s)
+          PYINNER
+          grep -c 'target_os = "ios"' crates/rc-client-core/src/signal_client.rs
 
       - name: Write cargo patch config
         run: |
