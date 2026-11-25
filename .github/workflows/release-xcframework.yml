@@ -39,7 +39,7 @@ jobs:
       - name: Clone patched core (iOS cfg 放宽)
         run: |
           # core 版本以 Cargo.toml 钉的 tag 为准;iOS 适配补丁在 patches/core-ios-cfg.patch
-          # (rc-capture CVPixelBuffer + 信令 EINPROGRESS 的 cfg 放宽,上游 PR 流程中,合并后可移除)。
+          # (rc-capture CVPixelBuffer 的 iOS cfg 放宽;信令/中继 EINPROGRESS 已合入 core v0.1.14)。
           CORE_TAG=$(grep -m1 'tag = ' Cargo.toml | sed 's/.*tag = "\(.*\)"/\1/')
           echo "core tag: $CORE_TAG"
           git clone --depth 1 --branch "$CORE_TAG" \
@@ -47,7 +47,7 @@ jobs:
           cd "$RUNNER_TEMP/core"
           git apply "$GITHUB_WORKSPACE/patches/core-ios-cfg.patch"
           grep -c 'target_os = "ios"' crates/rc-capture/src/lib.rs
-          grep -c 'target_os = "ios"' crates/rc-client-core/src/signal_client.rs
+          grep -c 'target_vendor = "apple"' crates/rc-client-core/src/signal_client.rs
 
       - name: Write cargo patch config
         run: |
