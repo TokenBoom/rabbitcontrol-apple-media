@@ -38,26 +38,15 @@ jobs:
 
       - name: Clone patched core (iOS cfg 放宽)
         run: |
-          # core 版本以 Cargo.toml 钉的 tag 为准;rc-capture 的 CVPixelBuffer 变体在 macos-only cfg 后,
-          # iOS 编译需要放宽(上游 PR TokenBoom/rabbitcontrol-core#2,未合并前在此打补丁)。
+          # core 版本以 Cargo.toml 钉的 tag 为准;iOS 适配补丁在 patches/core-ios-cfg.patch
+          # (rc-capture CVPixelBuffer + 信令 EINPROGRESS 的 cfg 放宽,上游 PR 流程中,合并后可移除)。
           CORE_TAG=$(grep -m1 'tag = ' Cargo.toml | sed 's/.*tag = "\(.*\)"/\1/')
           echo "core tag: $CORE_TAG"
           git clone --depth 1 --branch "$CORE_TAG" \
             https://github.com/TokenBoom/rabbitcontrol-core.git "$RUNNER_TEMP/core"
           cd "$RUNNER_TEMP/core"
-          sed -i '' 's/#\[cfg(target_os = "macos")\]/#[cfg(any(target_os = "macos", target_os = "ios"))]/' crates/rc-capture/src/lib.rs
+          git apply "$GITHUB_WORKSPACE/patches/core-ios-cfg.patch"
           grep -c 'target_os = "ios"' crates/rc-capture/src/lib.rs
-          # 信令非阻塞 connect 的 EINPROGRESS 分支同样需覆盖 iOS(上游 PR 流程中)
-          python3 - <<'PYINNER'
-          import re
-          sp = 'crates/rc-client-core/src/signal_client.rs'
-          s = open(sp).read()
-          s = s.replace('#[cfg(target_os = "macos")]\n        {\n            matches!(err.raw_os_error(), Some(36 | 37))',
-                        '#[cfg(any(target_os = "macos", target_os = "ios"))]\n        {\n            matches!(err.raw_os_error(), Some(36 | 37))')
-          s = s.replace('#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]',
-                        '#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux", windows)))]')
-          open(sp, 'w').write(s)
-          PYINNER
           grep -c 'target_os = "ios"' crates/rc-client-core/src/signal_client.rs
 
       - name: Write cargo patch config
