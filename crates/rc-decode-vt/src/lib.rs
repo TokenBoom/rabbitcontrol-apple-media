@@ -166,6 +166,7 @@ mod platform {
     use rc_decode::{DecodeOutput, DecodeSubmitStatus, DecodedFrame, Decoder};
     use rc_encode::Codec;
     use rc_types::{Error, FrameKind, Result, Timestamp};
+    use std::collections::VecDeque;
     use std::fmt;
     use std::ops::Range;
     use std::time::{Duration, Instant};
@@ -188,17 +189,22 @@ mod platform {
     pub struct VtDecoder {
         cfg: VtDecoderConfig,
         gate: RefChainGate,
-        /// 异步流水线中是否存在已提交但尚未回调的 IDR（允许紧随其后的 P 帧进入第 2 槽）。
-        idr_in_flight: usize,
-        /// 惰性建立的解码会话；参数集变化时重建。
+        /// 惰性建立的解码会话；参数集变化时先构造新会话成功后再排空替换。
         session: Option<ffi::DecompressionSession>,
+        /// 会话重建期间从旧会话排空保留的已完成输出（FIFO，容量 ≤ 2），附带该帧在旧会话上的
+        /// 参考链健康态 `old_chain_ok`，确保每个已提交 token 均能由 `recv_decoded` 交付，
+        /// 既不与上层失步，也不放行已断链的旧会话 P 帧（D4）。
+        drained_outputs: VecDeque<(ffi::PipelinedDecodeOutput, bool)>,
+        /// 上一帧交付给调用方的输出缓冲保活引用（下一次 `decode` / `recv_decoded` / 销毁前有效）。
+        last_output: Option<ffi::OwnedDecodeOutput>,
         /// 当前会话对应的参数集键（H.264 为 SPS；HEVC 为 VPS||SPS||PPS，检测变化与分辨率切换）。
         session_params: Option<Vec<u8>>,
-        /// 会话内单调帧号（邮箱匹配 + PTS 单调）。
+        /// 会话内单调帧号（邮箱匹配 + PTS 单调；提交前递增永不复用）。
         frame_id: u64,
-        /// 逻辑时钟（微秒，与 `Timestamp` 同为 u32 域）：最近一次实际解码
-        /// 调用的完成时刻。
+        /// 逻辑时钟（微秒，与 `Timestamp` 同为 u32 域）：按非重叠墙钟解码区间推进。
         clock_us: u32,
+        /// 上一次推进逻辑时钟的墙钟完成点，用于消除 2-deep 并行重叠双算与渲染等待污染。
+        last_clock_advance: Option<Instant>,
         /// 可复用的 NAL 范围暂存区（避免每帧分配 `Vec<(u8, &[u8])>`）。
         nals_scratch: Vec<(u8, Range<usize>)>,
         /// 可复用的 AVCC/HVCC 拼装暂存区（避免每帧重复分配 `Vec<u8>`）。
@@ -227,11 +233,13 @@ mod platform {
             Ok(VtDecoder {
                 cfg,
                 gate: RefChainGate::new(),
-                idr_in_flight: 0,
                 session: None,
+                drained_outputs: VecDeque::with_capacity(ffi::PIPELINED_MAX_IN_FLIGHT),
+                last_output: None,
                 session_params: None,
                 frame_id: 0,
                 clock_us: 0,
+                last_clock_advance: None,
                 nals_scratch: Vec::with_capacity(8),
                 avcc_scratch: Vec::new(),
             })
@@ -242,11 +250,40 @@ mod platform {
             self.frame_id
         }
 
+        /// 当前活跃会话中是否存在尚未回调的 IDR（不计入旧销毁会话的 `drained_outputs`）。
+        fn has_idr_in_flight(&self) -> bool {
+            self.session
+                .as_ref()
+                .is_some_and(ffi::DecompressionSession::has_idr_in_flight)
+        }
+
         /// 推进逻辑时钟（按实测墙钟耗时，饱和到 u32::MAX）并返回完成时刻。
         fn advance_clock(&mut self, elapsed: Duration) -> Timestamp {
             let us = u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX);
             self.clock_us = self.clock_us.saturating_add(us);
             Timestamp(self.clock_us)
+        }
+
+        /// 按非重叠硬件解码区间推进逻辑时钟：在 2-deep 并行重叠或调用方 VSync 阻塞场景下，
+        /// 仅计入 `[max(started, last_clock_advance), completed_at]` 增量，防止双算导致假超时。
+        pub(crate) fn advance_clock_span(
+            &mut self,
+            started: Instant,
+            completed_at: Instant,
+        ) -> Timestamp {
+            let start_bound = match self.last_clock_advance {
+                Some(prev) if prev > started => prev,
+                _ => started,
+            };
+            let delta = completed_at.saturating_duration_since(start_bound);
+            let should_update = match self.last_clock_advance {
+                None => true,
+                Some(prev) => completed_at > prev,
+            };
+            if should_update {
+                self.last_clock_advance = Some(completed_at);
+            }
+            self.advance_clock(delta)
         }
     }
 
@@ -267,14 +304,14 @@ mod platform {
 
         fn needs_keyframe(&self) -> bool {
             // 参考链断裂（且无在途 IDR 即将重建链）即需要关键帧。
-            !self.gate.is_ok() && self.idr_in_flight == 0
+            !self.gate.is_ok() && !self.has_idr_in_flight()
         }
 
         fn flush(&mut self) -> Result<()> {
+            self.drained_outputs.clear();
             if let Some(session) = self.session.as_mut() {
                 session.wait_and_clear();
             }
-            self.idr_in_flight = 0;
             Ok(())
         }
 
@@ -289,6 +326,12 @@ mod platform {
             kind: FrameKind,
             deadline_ts: Timestamp,
         ) -> Result<DecodeSubmitStatus> {
+            if self.in_flight_count() >= ffi::PIPELINED_MAX_IN_FLIGHT {
+                return Err(Error::Decoder(format!(
+                    "pipelined decode in_flight limit ({}) reached",
+                    ffi::PIPELINED_MAX_IN_FLIGHT
+                )));
+            }
             match self.prepare_frame(data, kind, deadline_ts, true)? {
                 PrepareOutcome::NeedKeyframe => Ok(DecodeSubmitStatus::NeedKeyframe),
                 PrepareOutcome::Ready { content_is_idr } => {
@@ -299,65 +342,98 @@ mod platform {
                         .frame_id
                         .checked_add(1)
                         .ok_or_else(|| Error::Decoder("会话帧号耗尽 u64".to_string()))?;
-                    session
-                        .submit_decode_frame(&self.avcc_scratch, submit_id, token, content_is_idr)
-                        .map_err(|e| Error::Decoder(e.to_string()))?;
+                    // 提交前即推进 frame_id，即使 VT 返回非零错误也绝不复用 submit_id（防邮箱碰撞）。
                     self.frame_id = submit_id;
-                    if content_is_idr {
-                        self.idr_in_flight += 1;
+                    if let Err(e) = session.submit_decode_frame(
+                        &self.avcc_scratch,
+                        submit_id,
+                        token,
+                        content_is_idr,
+                    ) {
+                        // D4：提交失败导致该帧丢失，立即打断参考链并请求关键帧。
+                        self.gate.break_chain();
+                        return Err(Error::Decoder(e.to_string()));
                     }
                     Ok(DecodeSubmitStatus::Submitted)
                 }
             }
         }
 
-        fn recv_decoded(&mut self, timeout: Duration) -> Result<Option<(u64, DecodeOutput)>> {
-            let Some(session) = self.session.as_mut() else {
-                return Ok(None);
-            };
-            let Some(item) = session.recv_decoded_frame(timeout) else {
-                return Ok(None);
-            };
-            if item.content_is_idr {
-                self.idr_in_flight = self.idr_in_flight.saturating_sub(1);
-            }
+        fn recv_decoded(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<Option<(u64, Result<DecodeOutput>)>> {
+            let (item, drained_chain_ok) =
+                if let Some((drained, old_chain_ok)) = self.drained_outputs.pop_front() {
+                    (drained, Some(old_chain_ok))
+                } else {
+                    let Some(session) = self.session.as_mut() else {
+                        return Ok(None);
+                    };
+                    let Some(item) = session.recv_decoded_frame(timeout) else {
+                        return Ok(None);
+                    };
+                    (item, None)
+                };
+            let from_drained = drained_chain_ok.is_some();
+            let elapsed = item.completed_at.saturating_duration_since(item.started);
             match item.result {
                 Ok(out) => {
-                    let done_ts = self.advance_clock(item.elapsed);
-                    if item.content_is_idr {
+                    let done_ts = self.advance_clock_span(item.started, item.completed_at);
+                    if let Some(old_chain_ok) = drained_chain_ok {
+                        // 旧会话排空帧不修改新会话门控；若旧会话在该帧处参考链已断（D4），仍丢弃旧 P 帧防花屏。
+                        if !item.content_is_idr && !old_chain_ok {
+                            return Ok(Some((item.token, Ok(DecodeOutput::NeedKeyframe))));
+                        }
+                    } else if item.content_is_idr {
                         self.gate.mark_idr_decoded();
+                    } else if !self.gate.is_ok() {
+                        // D4：当前会话前序在途帧已打断参考链，丢弃本在途 P 帧防花屏。
+                        return Ok(Some((item.token, Ok(DecodeOutput::NeedKeyframe))));
                     }
+                    let ptr = out.as_ptr();
+                    let width = out.width;
+                    let height = out.height;
+                    self.last_output = Some(out);
                     Ok(Some((
                         item.token,
-                        DecodeOutput::Frame(DecodedFrame {
-                            texture: FrameTexture::CVPixelBuffer(out.ptr),
+                        Ok(DecodeOutput::Frame(DecodedFrame {
+                            texture: FrameTexture::CVPixelBuffer(ptr),
                             decode_done_ts: done_ts,
-                            width: out.width,
-                            height: out.height,
-                        }),
+                            width,
+                            height,
+                        })),
                     )))
                 }
                 Err(ffi::DecodeFailure::Timeout) => {
-                    self.gate.break_chain();
-                    self.advance_clock(item.elapsed);
-                    Err(Error::Timeout(item.elapsed))
+                    if !from_drained {
+                        self.gate.break_chain();
+                    }
+                    self.advance_clock_span(item.started, item.completed_at);
+                    Ok(Some((item.token, Err(Error::Timeout(elapsed)))))
                 }
                 Err(ffi::DecodeFailure::Callback(_)) if !item.content_is_idr => {
-                    self.gate.break_chain();
-                    self.advance_clock(item.elapsed);
-                    Ok(Some((item.token, DecodeOutput::NeedKeyframe)))
+                    if !from_drained {
+                        self.gate.break_chain();
+                    }
+                    self.advance_clock_span(item.started, item.completed_at);
+                    Ok(Some((item.token, Ok(DecodeOutput::NeedKeyframe))))
                 }
                 Err(e) => {
-                    self.gate.break_chain();
-                    Err(Error::Decoder(e.to_string()))
+                    if !from_drained {
+                        self.gate.break_chain();
+                    }
+                    Ok(Some((item.token, Err(Error::Decoder(e.to_string())))))
                 }
             }
         }
 
         fn in_flight_count(&self) -> usize {
-            self.session
-                .as_ref()
-                .map_or(0, ffi::DecompressionSession::in_flight_count)
+            self.drained_outputs.len()
+                + self
+                    .session
+                    .as_ref()
+                    .map_or(0, ffi::DecompressionSession::in_flight_count)
         }
     }
 
@@ -367,6 +443,7 @@ mod platform {
             content_is_idr: bool,
             deadline_ts: Timestamp,
         ) -> Result<DecodeOutput> {
+            self.drained_outputs.clear();
             let Some(session) = self.session.as_mut() else {
                 return Ok(DecodeOutput::NeedKeyframe);
             };
@@ -380,26 +457,31 @@ mod platform {
             let started = Instant::now();
             match session.decode_frame(&self.avcc_scratch, frame_id, wait) {
                 Ok(out) => {
-                    let done_ts = self.advance_clock(started.elapsed());
+                    let done_ts = self.advance_clock_span(started, Instant::now());
                     if content_is_idr {
                         self.gate.mark_idr_decoded();
                     }
+                    let ptr = out.as_ptr();
+                    let width = out.width;
+                    let height = out.height;
+                    self.last_output = Some(out);
                     Ok(DecodeOutput::Frame(DecodedFrame {
-                        texture: FrameTexture::CVPixelBuffer(out.ptr),
+                        texture: FrameTexture::CVPixelBuffer(ptr),
                         decode_done_ts: done_ts,
-                        width: out.width,
-                        height: out.height,
+                        width,
+                        height,
                     }))
                 }
                 Err(ffi::DecodeFailure::Timeout) => {
                     self.gate.break_chain();
-                    let elapsed = started.elapsed();
-                    self.advance_clock(elapsed);
+                    let now = Instant::now();
+                    let elapsed = now.saturating_duration_since(started);
+                    self.advance_clock_span(started, now);
                     Err(Error::Timeout(elapsed))
                 }
                 Err(ffi::DecodeFailure::Callback(_)) if !content_is_idr => {
                     self.gate.break_chain();
-                    self.advance_clock(started.elapsed());
+                    self.advance_clock_span(started, Instant::now());
                     Ok(DecodeOutput::NeedKeyframe)
                 }
                 Err(e) => {
@@ -421,6 +503,7 @@ mod platform {
                 && self.clock_us.wrapping_sub(deadline_ts.0) > u32::MAX / 2
             {
                 self.clock_us = 0;
+                self.last_clock_advance = None;
             }
             match self.cfg.codec {
                 Codec::H264 => self.prepare_h264(data, kind, deadline_ts, pipelined),
@@ -430,6 +513,34 @@ mod platform {
                     other
                 ))),
             }
+        }
+
+        fn replace_session(
+            &mut self,
+            new_session: ffi::DecompressionSession,
+            new_params: Vec<u8>,
+            pipelined: bool,
+        ) {
+            if let Some(mut old) = self.session.take() {
+                if pipelined {
+                    let mut old_chain_ok = self.gate.is_ok();
+                    for out in old.drain_all_in_flight() {
+                        match &out.result {
+                            Ok(_) if out.content_is_idr => old_chain_ok = true,
+                            Err(_) => old_chain_ok = false,
+                            Ok(_) => {}
+                        }
+                        self.drained_outputs.push_back((out, old_chain_ok));
+                    }
+                } else {
+                    old.wait_and_clear();
+                    self.drained_outputs.clear();
+                }
+            }
+            // 新会话 DPB 为空，须在其自身解出首张 IDR 后再恢复参考链门控。
+            self.gate.break_chain();
+            self.session = Some(new_session);
+            self.session_params = Some(new_params);
         }
 
         fn prepare_h264(
@@ -469,12 +580,12 @@ mod platform {
                 ))));
             }
 
-            let chain_available = self.gate.is_ok() || (pipelined && self.idr_in_flight > 0);
+            let chain_available = self.gate.is_ok() || (pipelined && self.has_idr_in_flight());
             if !chain_available && !content_is_idr {
                 return Ok(PrepareOutcome::NeedKeyframe);
             }
 
-            if content_is_idr {
+            let pending_rebuild = if content_is_idr {
                 let (sps, pps) = crate::h264::parameter_sets_from_ranges(data, &self.nals_scratch);
                 match (sps, pps) {
                     (Some(sps), Some(pps)) => {
@@ -494,25 +605,23 @@ mod platform {
                                     )));
                                 }
                             }
-                            if let Some(old) = self.session.as_mut() {
-                                old.wait_and_clear();
-                            }
-                            self.idr_in_flight = 0;
-                            self.session = Some(
-                                ffi::DecompressionSession::new(sps, pps).map_err(Error::Decoder)?,
-                            );
-                            self.session_params = Some(sps.to_vec());
+                            Some((sps, pps))
+                        } else {
+                            None
                         }
                     }
                     _ if self.session.is_none() => return Ok(PrepareOutcome::NeedKeyframe),
-                    _ => {}
+                    _ => None,
                 }
-            }
+            } else {
+                None
+            };
 
-            if self.session.is_none() {
+            if pending_rebuild.is_none() && self.session.is_none() {
                 return Ok(PrepareOutcome::NeedKeyframe);
             }
 
+            // 先完成 Annex-B → AVCC 转换校验，确保全部可能失败步骤都在 replace_session 之前完成。
             if crate::h264::nals_ranges_to_avcc_into(
                 data,
                 &self.nals_scratch,
@@ -523,6 +632,12 @@ mod platform {
                 return Err(Error::InvalidFrame(
                     "帧不含任何 slice NAL（无法解码出画面）".to_string(),
                 ));
+            }
+
+            if let Some((sps, pps)) = pending_rebuild {
+                let new_session =
+                    ffi::DecompressionSession::new(sps, pps).map_err(Error::Decoder)?;
+                self.replace_session(new_session, sps.to_vec(), pipelined);
             }
 
             Ok(PrepareOutcome::Ready { content_is_idr })
@@ -568,12 +683,12 @@ mod platform {
                 ))));
             }
 
-            let chain_available = self.gate.is_ok() || (pipelined && self.idr_in_flight > 0);
+            let chain_available = self.gate.is_ok() || (pipelined && self.has_idr_in_flight());
             if !chain_available && !content_is_idr {
                 return Ok(PrepareOutcome::NeedKeyframe);
             }
 
-            if content_is_idr {
+            let pending_rebuild = if content_is_idr {
                 let params = crate::h265::parameter_sets_from_ranges(data, &self.nals_scratch);
                 match (params.vps, params.sps, params.pps) {
                     (Some(vps), Some(sps), Some(pps)) => {
@@ -591,42 +706,23 @@ mod platform {
                             let pps_len = u16::try_from(pps.len()).map_err(|_| {
                                 Error::InvalidFrame("HEVC PPS 长度超过 u16::MAX".to_string())
                             })?;
-                            if let Some(old) = self.session.as_mut() {
-                                old.wait_and_clear();
-                            }
-                            self.idr_in_flight = 0;
-                            self.session = Some(
-                                ffi::DecompressionSession::new_hevc(
-                                    vps,
-                                    sps,
-                                    pps,
-                                    self.cfg.max_resolution.width,
-                                    self.cfg.max_resolution.height,
-                                )
-                                .map_err(|e| match e {
-                                    Ok(dec_err) => Error::Decoder(dec_err),
-                                    Err(frame_err) => Error::InvalidFrame(frame_err),
-                                })?,
-                            );
-                            let mut key = Vec::with_capacity(vps.len() + sps.len() + pps.len() + 6);
-                            key.extend_from_slice(&vps_len.to_be_bytes());
-                            key.extend_from_slice(vps);
-                            key.extend_from_slice(&sps_len.to_be_bytes());
-                            key.extend_from_slice(sps);
-                            key.extend_from_slice(&pps_len.to_be_bytes());
-                            key.extend_from_slice(pps);
-                            self.session_params = Some(key);
+                            Some((vps, sps, pps, vps_len, sps_len, pps_len))
+                        } else {
+                            None
                         }
                     }
                     _ if self.session.is_none() => return Ok(PrepareOutcome::NeedKeyframe),
-                    _ => {}
+                    _ => None,
                 }
-            }
+            } else {
+                None
+            };
 
-            if self.session.is_none() {
+            if pending_rebuild.is_none() && self.session.is_none() {
                 return Ok(PrepareOutcome::NeedKeyframe);
             }
 
+            // 先完成 Annex-B → HVCC 转换校验，确保 replace_session 为最终不可逆步骤。
             if crate::h265::nals_ranges_to_hvcc_into(
                 data,
                 &self.nals_scratch,
@@ -637,6 +733,28 @@ mod platform {
                 return Err(Error::InvalidFrame(
                     "HEVC 帧不含任何 slice NAL（无法解码出画面）".to_string(),
                 ));
+            }
+
+            if let Some((vps, sps, pps, vps_len, sps_len, pps_len)) = pending_rebuild {
+                let new_session = ffi::DecompressionSession::new_hevc(
+                    vps,
+                    sps,
+                    pps,
+                    self.cfg.max_resolution.width,
+                    self.cfg.max_resolution.height,
+                )
+                .map_err(|e| match e {
+                    Ok(dec_err) => Error::Decoder(dec_err),
+                    Err(frame_err) => Error::InvalidFrame(frame_err),
+                })?;
+                let mut key = Vec::with_capacity(vps.len() + sps.len() + pps.len() + 6);
+                key.extend_from_slice(&vps_len.to_be_bytes());
+                key.extend_from_slice(vps);
+                key.extend_from_slice(&sps_len.to_be_bytes());
+                key.extend_from_slice(sps);
+                key.extend_from_slice(&pps_len.to_be_bytes());
+                key.extend_from_slice(pps);
+                self.replace_session(new_session, key, pipelined);
             }
 
             Ok(PrepareOutcome::Ready { content_is_idr })
@@ -854,5 +972,22 @@ mod gates_no_gpu {
             .recv_decoded(std::time::Duration::ZERO)
             .expect("无在途帧返回 Ok(None)")
             .is_none());
+    }
+
+    #[test]
+    fn advance_clock_span_does_not_double_count_overlapping_pipelined_frames() {
+        let mut dec = VtDecoder::new(VtDecoderConfig::default()).expect("配置合法");
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_micros(1_500);
+        let t2_start = t0 + std::time::Duration::from_micros(200);
+        let t2_done = t0 + std::time::Duration::from_micros(2_000);
+
+        let ts1 = dec.advance_clock_span(t0, t1);
+        let ts2 = dec.advance_clock_span(t2_start, t2_done);
+        assert_eq!(ts1.0, 1_500, "首帧应计入完整 1500us");
+        assert_eq!(
+            ts2.0, 2_000,
+            "重叠帧仅计入非重叠增量 500us（总计 2000us），不得双算为 3300us"
+        );
     }
 }

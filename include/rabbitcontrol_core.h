@@ -102,14 +102,8 @@ bool rc_apple_media_frame_take_raw(RcAppleFrame *out);
 /// 返回字符串用毕调 rc_string_free 释放(同一分配器)。
 char *rc_apple_media_frame_take(void);
 
-/// 释放帧(仅限 rc_apple_media_frame_take 取走的 ptr,每帧一次)。
-void rc_apple_media_frame_release(unsigned long long ptr);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif // RABBITCONTROL_CORE_H
+/// 释放帧(仅限 rc_apple_media_frame_take / rc_apple_media_frame_take_raw 取走的 ptr,每帧一次)。
+void rc_apple_media_frame_release(uint64_t ptr);
 
 // ── 运行时(有状态:认证会话+信令+一键连接)──
 char *rc_runtime_init(const char *json);
@@ -124,3 +118,9 @@ char *rc_runtime_connect(const char *json);
 // ── 工具通道(文件/终端/端口映射)──
 char *rc_tools_call(uint64_t session_id, const char *json);
 char *rc_tools_poll(uint64_t session_id);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // RABBITCONTROL_CORE_H

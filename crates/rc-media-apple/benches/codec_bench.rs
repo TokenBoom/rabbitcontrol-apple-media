@@ -36,7 +36,6 @@ mod macos_bench {
     #![deny(unsafe_op_in_unsafe_fn)]
     #![deny(clippy::undocumented_unsafe_blocks)]
 
-    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::ffi::{c_char, c_int, c_void, CStr};
     use std::fs;
@@ -575,36 +574,40 @@ mod macos_bench {
         if st != 0 || session_out.is_null() {
             return Err(format!("VTCompressionSessionCreate 失败: {st}"));
         }
+        let enc_guard = VtEncSessionGuard {
+            session: session_out,
+            shared: Arc::clone(&shared),
+        };
 
         // SAFETY: 读取全局 SDK 常量并设置与 rc-encode-vt 完全一致的属性。
         unsafe {
             let _ = set_vt_prop(
-                session_out,
+                enc_guard.session,
                 raw::kVTCompressionPropertyKey_RealTime,
                 CFBoolean::new(true),
             )?;
             let _ = set_vt_prop(
-                session_out,
+                enc_guard.session,
                 raw::kVTCompressionPropertyKey_AllowFrameReordering,
                 CFBoolean::new(false),
             )?;
             let _ = set_vt_prop(
-                session_out,
+                enc_guard.session,
                 raw::kVTCompressionPropertyKey_MaxKeyFrameInterval,
                 &*CFNumber::new_i32(i32::MAX),
             )?;
             let _ = set_vt_prop(
-                session_out,
+                enc_guard.session,
                 raw::kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
                 &*CFNumber::new_f64(0.0),
             )?;
             let _ = set_vt_prop(
-                session_out,
+                enc_guard.session,
                 raw::kVTCompressionPropertyKey_AverageBitRate,
                 &*CFNumber::new_i64(i64::from(bitrate_bps)),
             )?;
             let _ = set_vt_prop(
-                session_out,
+                enc_guard.session,
                 raw::kVTCompressionPropertyKey_ExpectedFrameRate,
                 &*CFNumber::new_i32(fps as i32),
             )?;
@@ -617,19 +620,17 @@ mod macos_bench {
             }
             .ok_or("缺少 ProfileLevel 常量")?;
             let _ = set_vt_prop(
-                session_out,
+                enc_guard.session,
                 raw::kVTCompressionPropertyKey_ProfileLevel,
                 profile,
             )?;
             let _ = set_vt_prop(
-                session_out,
+                enc_guard.session,
                 raw::kVTCompressionPropertyKey_MaximizePowerEfficiency,
                 CFBoolean::new(false),
             );
-            let prep = raw::VTCompressionSessionPrepareToEncodeFrames(session_out);
+            let prep = raw::VTCompressionSessionPrepareToEncodeFrames(enc_guard.session);
             if prep != 0 {
-                raw::VTCompressionSessionInvalidate(session_out);
-                raw::CFRelease(session_out.cast_const());
                 return Err(format!("PrepareToEncodeFrames 失败: {prep}"));
             }
         }
@@ -657,7 +658,6 @@ mod macos_bench {
         let mut frames = Vec::with_capacity(frame_count);
         let mut param_sets: Vec<Vec<u8>> = Vec::new();
         let mut enc_latencies_us = Vec::with_capacity(frame_count);
-        let wall_start = Instant::now();
 
         for i in 0..frame_count {
             let force_idr = i == 0;
@@ -674,10 +674,10 @@ mod macos_bench {
             };
             let mut info_flags = 0u32;
             let t0 = Instant::now();
-            // SAFETY: session_out 有效，pixel buffer 来自存活的 pool，props_ptr 有效或 null。
+            // SAFETY: enc_guard.session 有效，pixel buffer 来自存活的 pool，props_ptr 有效或 null。
             let st = unsafe {
                 raw::VTCompressionSessionEncodeFrame(
-                    session_out,
+                    enc_guard.session,
                     pool.ptr_at(i),
                     pts,
                     CMTIME_INVALID,
@@ -826,15 +826,9 @@ mod macos_bench {
                 nal_count,
             });
         }
-        let enc_wall_s = wall_start.elapsed().as_secs_f64();
-
-        // SAFETY: CompleteFrames → Invalidate → 锁屏障 → CFRelease。
-        unsafe {
-            raw::VTCompressionSessionCompleteFrames(session_out, CMTIME_INVALID);
-            raw::VTCompressionSessionInvalidate(session_out);
-            drop(shared.state.lock().unwrap_or_else(|e| e.into_inner()));
-            raw::CFRelease(session_out.cast_const());
-        }
+        // 仅汇总稳态 P 帧编码耗时（剔除首帧冷 IDR 及后处理 Annex-B 拼装，与 dec_max_fps 口径一致）。
+        let enc_wall_s = enc_latencies_us.iter().sum::<f64>() / 1e6;
+        drop(enc_guard);
 
         Ok(GeneratedStream {
             codec,
@@ -1249,14 +1243,60 @@ mod macos_bench {
         }))
     }
 
-    // 同步内联解码（无 Mutex/Condvar，直接写调用栈槽）
-    struct InlineSlot {
-        called_inline: Cell<bool>,
-        status: Cell<OSStatus>,
-        width: Cell<u32>,
-        height: Cell<u32>,
-        last_buf: Cell<Option<CFRetained<CVPixelBuffer>>>,
+    struct VtEncSessionGuard {
+        session: *mut c_void,
+        shared: Arc<EncShared>,
     }
+
+    impl Drop for VtEncSessionGuard {
+        fn drop(&mut self) {
+            if !self.session.is_null() {
+                // SAFETY: CompleteFrames → Invalidate → 锁屏障 → CFRelease，保证先于 shared 释放。
+                unsafe {
+                    raw::VTCompressionSessionCompleteFrames(self.session, CMTIME_INVALID);
+                    raw::VTCompressionSessionInvalidate(self.session);
+                    drop(self.shared.state.lock().unwrap_or_else(|e| e.into_inner()));
+                    raw::CFRelease(self.session.cast_const());
+                }
+            }
+        }
+    }
+
+    struct VtDecSessionGuard<T> {
+        session: *mut c_void,
+        _refcon_owner: T,
+    }
+
+    impl<T> Drop for VtDecSessionGuard<T> {
+        fn drop(&mut self) {
+            if !self.session.is_null() {
+                // SAFETY: WaitForAsynchronousFrames → Invalidate → CFRelease，先于 _refcon_owner 析构。
+                unsafe {
+                    raw::VTDecompressionSessionWaitForAsynchronousFrames(self.session);
+                    raw::VTDecompressionSessionInvalidate(self.session);
+                    raw::CFRelease(self.session.cast_const());
+                }
+            }
+        }
+    }
+
+    // 同步内联解码（Mutex 保护，确保即使驱动意外异步回调也不存在 !Sync 数据竞争）
+    struct InlineSlotState {
+        called_inline: bool,
+        status: OSStatus,
+        width: u32,
+        height: u32,
+        last_buf: Option<CFRetained<CVPixelBuffer>>,
+    }
+
+    struct InlineSlot {
+        inner: Mutex<InlineSlotState>,
+    }
+
+    // SAFETY: 内部全由 Mutex 保护，CFRetained 引用计数线程安全。
+    unsafe impl Send for InlineSlot {}
+    // SAFETY: 同上。
+    unsafe impl Sync for InlineSlot {}
 
     unsafe extern "C" fn inline_decode_cb(
         refcon: *mut c_void,
@@ -1267,16 +1307,19 @@ mod macos_bench {
         _pts: CMTime,
         _dur: CMTime,
     ) {
-        // SAFETY: decodeFlags=0 同步路径下回调在 DecodeFrame 返回前于同线程触发，refcon 指向存活的 InlineSlot。
+        // SAFETY: refcon 指向由 VtDecSessionGuard 保活的 Arc<InlineSlot>。
         let slot = unsafe { &*(refcon as *const InlineSlot) };
-        slot.called_inline.set(true);
-        slot.status.set(status);
-        if let Some(pb) = NonNull::new(image_buffer) {
+        let retained = NonNull::new(image_buffer).map(|pb| {
             // SAFETY: 回调期间 image_buffer 有效，retain +1。
-            let retained = unsafe { CFRetained::retain(pb) };
-            slot.width.set(CVPixelBufferGetWidth(&retained) as u32);
-            slot.height.set(CVPixelBufferGetHeight(&retained) as u32);
-            slot.last_buf.set(Some(retained));
+            unsafe { CFRetained::retain(pb) }
+        });
+        let mut g = slot.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.called_inline = true;
+        g.status = status;
+        if let Some(buf) = retained {
+            g.width = CVPixelBufferGetWidth(&buf) as u32;
+            g.height = CVPixelBufferGetHeight(&buf) as u32;
+            g.last_buf = Some(buf);
         }
     }
 
@@ -1447,13 +1490,24 @@ mod macos_bench {
         if st != 0 || session_out.is_null() {
             return Err(format!("VTDecompressionSessionCreate 失败: {st}"));
         }
-        // SAFETY: 设置 RealTime = true（D3）。
-        let rt_st = unsafe {
+        // SAFETY: 设置 RealTime = true（D3）；失败路径统一释放 session_out 避免泄漏。
+        let rt_res = unsafe {
             set_vt_prop(
                 session_out,
                 raw::kVTDecompressionPropertyKey_RealTime,
                 CFBoolean::new(true),
-            )?
+            )
+        };
+        let rt_st = match rt_res {
+            Ok(v) => v,
+            Err(e) => {
+                // SAFETY: 失败清理。
+                unsafe {
+                    raw::VTDecompressionSessionInvalidate(session_out);
+                    raw::CFRelease(session_out.cast_const());
+                }
+                return Err(e);
+            }
         };
         if rt_st != 0 && rt_st != K_VT_PROPERTY_NOT_SUPPORTED_ERR {
             // SAFETY: 失败清理。
@@ -1469,22 +1523,27 @@ mod macos_bench {
     fn bench_decode_ab_experiments(stream: &GeneratedStream) -> Result<serde_json::Value, String> {
         let desc = create_format_desc(stream.codec, &stream.param_sets)?;
 
-        // ── 1) Sync Inline（decodeFlags=0，无 Mutex/Condvar，直接 AVCC + zero-copy CMBlockBuffer）──
+        // ── 1) Sync Inline（decodeFlags=0，Mutex 保护防异步数据竞争，直接 AVCC + zero-copy CMBlockBuffer）──
         let run_sync_inline = |always_copy: bool,
                                explicit_attrs: bool|
          -> Result<(LatencySummary, f64, bool, bool), String> {
-            let slot = Box::new(InlineSlot {
-                called_inline: Cell::new(false),
-                status: Cell::new(0),
-                width: Cell::new(0),
-                height: Cell::new(0),
-                last_buf: Cell::new(None),
+            let slot = Arc::new(InlineSlot {
+                inner: Mutex::new(InlineSlotState {
+                    called_inline: false,
+                    status: 0,
+                    width: 0,
+                    height: 0,
+                    last_buf: None,
+                }),
             });
             let cb_rec = VtDecompressionOutputCallbackRecord {
                 callback: inline_decode_cb,
-                refcon: (&*slot as *const InlineSlot).cast_mut().cast(),
+                refcon: Arc::as_ptr(&slot) as *mut c_void,
             };
-            let session = create_vt_dec_session(&desc, &cb_rec, explicit_attrs)?;
+            let session_guard = VtDecSessionGuard {
+                session: create_vt_dec_session(&desc, &cb_rec, explicit_attrs)?,
+                _refcon_owner: Arc::clone(&slot),
+            };
 
             let mut all_inline = true;
             let mut saw_async_flag = false;
@@ -1492,32 +1551,43 @@ mod macos_bench {
             let mut wall_start: Option<Instant> = None;
 
             for (i, f) in stream.frames.iter().enumerate() {
-                slot.called_inline.set(false);
+                slot.inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .called_inline = false;
                 let t0 = Instant::now();
                 let sample = make_sample_buffer(&f.avcc, &desc, i as u64, always_copy)?;
                 let mut info_flags = 0u32;
-                // SAFETY: session/sample 有效，decodeFlags=0 同步解码。
+                // SAFETY: session_guard.session/sample 有效，decodeFlags=0 同步解码。
                 let st = unsafe {
                     raw::VTDecompressionSessionDecodeFrame(
-                        session,
+                        session_guard.session,
                         CFRetained::as_ptr(&sample).as_ptr().cast(),
                         0,
                         i as *mut c_void,
                         std::ptr::addr_of_mut!(info_flags),
                     )
                 };
-                let dt_us = t0.elapsed().as_secs_f64() * 1e6;
-                if st != 0 || slot.status.get() != 0 {
-                    return Err(format!(
-                        "sync inline decode 失败: st={st} cb={}",
-                        slot.status.get()
-                    ));
-                }
-                if !slot.called_inline.get() {
+                let called_before_wait = slot
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .called_inline;
+                if !called_before_wait {
                     all_inline = false;
                 }
                 if info_flags & K_VT_DECODE_INFO_ASYNCHRONOUS != 0 {
                     saw_async_flag = true;
+                    all_inline = false;
+                    // SAFETY: 若驱动意外异步执行，同步等待后再读取 slot。
+                    unsafe {
+                        raw::VTDecompressionSessionWaitForAsynchronousFrames(session_guard.session);
+                    }
+                }
+                let dt_us = t0.elapsed().as_secs_f64() * 1e6;
+                let cb_status = slot.inner.lock().unwrap_or_else(|e| e.into_inner()).status;
+                if st != 0 || cb_status != 0 {
+                    return Err(format!("sync inline decode 失败: st={st} cb={cb_status}"));
                 }
                 if i == 0 {
                     wall_start = Some(Instant::now());
@@ -1530,12 +1600,7 @@ mod macos_bench {
                 .unwrap_or(1e-6)
                 .max(1e-9);
             let fps = p_us.len() as f64 / wall_s;
-            // SAFETY: 按序释放会话。
-            unsafe {
-                raw::VTDecompressionSessionWaitForAsynchronousFrames(session);
-                raw::VTDecompressionSessionInvalidate(session);
-                raw::CFRelease(session.cast_const());
-            }
+            drop(session_guard);
             Ok((
                 LatencySummary::from_us(p_us),
                 fps,
@@ -1546,7 +1611,8 @@ mod macos_bench {
 
         let (sync_copy_sum, sync_copy_fps, all_inline_a, saw_async_a) =
             run_sync_inline(true, false)?;
-        let (sync_zcopy_sum, sync_zcopy_fps, all_inline_b, _) = run_sync_inline(false, false)?;
+        let (sync_zcopy_sum, sync_zcopy_fps, all_inline_b, saw_async_b) =
+            run_sync_inline(false, false)?;
         let (sync_explicit_sum, sync_explicit_fps, _, _) = run_sync_inline(false, true)?;
 
         // ── 2) Async Pipelined（kVTDecodeFrame_EnableAsynchronousDecompression，Depth = 1 / 2 / 4）──
@@ -1559,7 +1625,10 @@ mod macos_bench {
                 callback: async_decode_cb,
                 refcon: Arc::as_ptr(&queue) as *mut c_void,
             };
-            let session = create_vt_dec_session(&desc, &cb_rec, false)?;
+            let session_guard = VtDecSessionGuard {
+                session: create_vt_dec_session(&desc, &cb_rec, false)?,
+                _refcon_owner: Arc::clone(&queue),
+            };
 
             let mut submit_times: VecDeque<(u64, Instant)> = VecDeque::with_capacity(depth + 1);
             let mut p_lat_us = Vec::with_capacity(stream.frames.len());
@@ -1569,10 +1638,10 @@ mod macos_bench {
             let first = &stream.frames[0];
             let s0 = make_sample_buffer(&first.avcc, &desc, 0, true)?;
             let mut flags0 = 0u32;
-            // SAFETY: session/s0 有效。
+            // SAFETY: session_guard.session/s0 有效。
             let st0 = unsafe {
                 raw::VTDecompressionSessionDecodeFrame(
-                    session,
+                    session_guard.session,
                     CFRetained::as_ptr(&s0).as_ptr().cast(),
                     K_VT_DECODE_FRAME_ENABLE_ASYNC,
                     std::ptr::null_mut(),
@@ -1598,13 +1667,13 @@ mod macos_bench {
             for (idx, f) in stream.frames.iter().enumerate().skip(1) {
                 let id = idx as u64;
                 let t_sub = Instant::now();
-                // 异步解码时 avcc 在 stream.frames 中持续存活，故可用 zero-copy CMBlockBuffer！
+                // 异步解码时 session_guard.drop 先 WaitForAsynchronousFrames，故 stream.frames 始终晚于回调析构。
                 let sample = make_sample_buffer(&f.avcc, &desc, id, false)?;
                 let mut info_flags = 0u32;
-                // SAFETY: session/sample 有效，avcc 存活于整个函数周期。
+                // SAFETY: session_guard.session/sample 有效，avcc 存活至 session_guard 析构之后。
                 let st = unsafe {
                     raw::VTDecompressionSessionDecodeFrame(
-                        session,
+                        session_guard.session,
                         CFRetained::as_ptr(&sample).as_ptr().cast(),
                         K_VT_DECODE_FRAME_ENABLE_ASYNC,
                         id as usize as *mut c_void,
@@ -1652,14 +1721,7 @@ mod macos_bench {
             }
             let wall_s = wall_start.elapsed().as_secs_f64().max(1e-9);
             let fps = p_lat_us.len() as f64 / wall_s;
-
-            // SAFETY: 按序释放会话。
-            unsafe {
-                raw::VTDecompressionSessionWaitForAsynchronousFrames(session);
-                raw::VTDecompressionSessionInvalidate(session);
-                drop(queue.done.lock().unwrap_or_else(|e| e.into_inner()));
-                raw::CFRelease(session.cast_const());
-            }
+            drop(session_guard);
             Ok((LatencySummary::from_us(p_lat_us), fps))
         };
 
@@ -1669,7 +1731,7 @@ mod macos_bench {
 
         Ok(serde_json::json!({
             "sync_flags_0_called_inline": all_inline_a && all_inline_b,
-            "sync_flags_0_saw_async_info_flag": saw_async_a,
+            "sync_flags_0_saw_async_info_flag": saw_async_a || saw_async_b,
             "sync_inline_always_copy": { "fps": round2(sync_copy_fps), "latency": sync_copy_sum.to_json() },
             "sync_inline_zero_copy": { "fps": round2(sync_zcopy_fps), "latency": sync_zcopy_sum.to_json() },
             "sync_inline_zero_copy_explicit_metal": { "fps": round2(sync_explicit_fps), "latency": sync_explicit_sum.to_json() },
@@ -1716,24 +1778,53 @@ mod macos_bench {
         }
         let empty_json_ns = t0.elapsed().as_secs_f64() * 1e9 / iters as f64;
 
-        // 2) 模拟现网有帧命中：serde_json::json!({ptr,w,h,seq}).to_string() + CString + parse + free
+        // 2) 对称有帧命中对照（JSON 路径也含完整 present+Mutex+CFRetain/CFRelease+take+JSON+parse+free）
+        let json_slot = Mutex::new(FastSlot {
+            ptr: 0,
+            width: 0,
+            height: 0,
+            seq: 0,
+        });
+        let json_seq = AtomicU64::new(0);
         let t1 = Instant::now();
-        for i in 0..iters {
-            let s = serde_json::json!({
-                "ptr": sample_ptr as usize as u64,
-                "width": 1920u32,
-                "height": 1080u32,
-                "seq": i as u64,
-            })
-            .to_string();
-            let cs = std::ffi::CString::new(s).unwrap();
-            let raw_p = cs.into_raw();
-            // SAFETY: 刚由 CString::into_raw 构造。
+        for _ in 0..iters {
+            // SAFETY: sample_ptr 来自存活 pool，retain/release 成对平衡。
+            let old = unsafe {
+                raw::CFRetain(sample_ptr.cast_const());
+                let mut g = json_slot.lock().unwrap();
+                let old = g.ptr;
+                g.ptr = sample_ptr as usize;
+                g.width = 1920;
+                g.height = 1080;
+                g.seq = json_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                old
+            };
+            if old != 0 {
+                // SAFETY: 旧槽持有 +1 引用。
+                unsafe { raw::CFRelease(old as *const c_void) };
+            }
+            let raw_p = {
+                let mut g = json_slot.lock().unwrap();
+                let s = serde_json::json!({
+                    "ptr": g.ptr as u64,
+                    "width": g.width,
+                    "height": g.height,
+                    "seq": g.seq,
+                })
+                .to_string();
+                g.ptr = 0;
+                std::ffi::CString::new(s).unwrap().into_raw()
+            };
+            // SAFETY: 刚由 CString::into_raw 构造，ptr 持有 +1 引用。
             unsafe {
                 let parsed: serde_json::Value =
                     serde_json::from_str(CStr::from_ptr(raw_p).to_str().unwrap()).unwrap();
-                black_box(parsed["ptr"].as_u64());
+                let ptr_u64 = parsed["ptr"].as_u64().unwrap_or(0);
+                black_box(ptr_u64);
                 rc_media_apple::rc_apple_media_string_free(raw_p);
+                if ptr_u64 != 0 {
+                    raw::CFRelease(ptr_u64 as *const c_void);
+                }
             }
         }
         let hit_json_ns = t1.elapsed().as_secs_f64() * 1e9 / iters as f64;
@@ -1918,7 +2009,8 @@ mod macos_bench {
                     .sum::<f64>()
                     / stream.frames.len() as f64;
                 let enc_sum = LatencySummary::from_us(stream.enc_latencies_us.clone());
-                let enc_max_fps = stream.frames.len() as f64 / stream.enc_wall_s.max(1e-9);
+                let enc_max_fps =
+                    stream.enc_latencies_us.len() as f64 / stream.enc_wall_s.max(1e-9);
 
                 let row = MatrixRow {
                     label: format!("{w}x{h}@{fps}"),
@@ -2057,13 +2149,13 @@ mod macos_bench {
         let pump_json = bench_frame_pump_ffi(saved_pool_1080.as_ref().unwrap());
         println!("\n=== Part 3: `rc-media-apple` FramePumpRenderer & C ABI FFI 开销对比 ===");
         println!(
-            "  空轮询 take: 现网 JSON+CString = {:>7.1} ns/op  vs  原子标志+C struct = {:>5.1} ns/op  [提速 {:.1}x]",
+            "  空轮询 take: 现网 JSON+CString = {:>7.1} ns/op  vs  生产 take_raw(原子+C struct) = {:>5.1} ns/op  [提速 {:.1}x]",
             pump_json["empty_poll_current_json_ns"].as_f64().unwrap_or(0.0),
-            pump_json["empty_poll_c_struct_ns"].as_f64().unwrap_or(0.0),
+            pump_json["empty_poll_prod_take_raw_ns"].as_f64().unwrap_or(0.0),
             pump_json["empty_poll_speedup"].as_f64().unwrap_or(0.0),
         );
         println!(
-            "  有帧命中:   现网 JSON 序列化+解析 = {:>7.1} ns/op  vs  C struct+CFRetain/Release = {:>5.1} ns/op  [提速 {:.1}x]",
+            "  有帧命中(对称全链): JSON+CF = {:>7.1} ns/op  vs  C struct+CF = {:>5.1} ns/op  [提速 {:.1}x]",
             pump_json["hit_current_json_roundtrip_ns"].as_f64().unwrap_or(0.0),
             pump_json["hit_c_struct_with_cf_retain_release_ns"].as_f64().unwrap_or(0.0),
             pump_json["hit_speedup"].as_f64().unwrap_or(0.0),

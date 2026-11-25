@@ -306,10 +306,10 @@ pub extern "C" fn rc_apple_media_frame_take() -> *mut c_char {
     to_c_string(out.to_string())
 }
 
-/// 释放一帧 CVPixelBuffer(`rc_apple_media_frame_take` 取走的帧用毕必须调用)。
+/// 释放一帧 CVPixelBuffer(`rc_apple_media_frame_take` / `rc_apple_media_frame_take_raw` 取走的帧用毕必须调用)。
 ///
 /// # Safety
-/// `ptr` 必须为零或此前 `rc_apple_media_frame_take` 返回且尚未释放的帧指针;
+/// `ptr` 必须为零或此前 `rc_apple_media_frame_take` / `rc_apple_media_frame_take_raw` 返回且尚未释放的帧指针;
 /// 重复释放或传入非帧指针属于未定义行为。
 #[no_mangle]
 #[allow(unsafe_code)]

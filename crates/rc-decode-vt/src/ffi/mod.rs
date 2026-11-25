@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2_core_foundation::{CFBoolean, CFRetained, CFString};
@@ -202,6 +202,8 @@ struct CallbackPayload {
     status: OSStatus,
     /// 输出帧（回调里 retain +1 的自有引用）；成功但无输出帧时为 None。
     buffer: Option<CFRetained<CVPixelBuffer>>,
+    /// 回调触发时刻（用于非重叠解码耗时统计，排除调用方渲染/VSync 排队时间）。
+    completed_at: Instant,
 }
 
 // SAFETY: 载荷只在邮箱 Mutex 内移动（回调线程构造 → 等待线程消费，互不
@@ -211,15 +213,18 @@ unsafe impl Send for CallbackPayload {}
 
 /// 回调共享上下文：区分同步快路径（`source_frame_refcon == 0`，免 Condvar 唤醒与 VecDeque 扫描）
 /// 与异步流水线路径（`source_frame_refcon != 0`，投递至帧序邮箱）。
+/// `sync_slot.1` 表示主线程是否在异步回退路径上等待，常规同步内联路径下为 `false`，零 `notify_one` 开销。
 struct CallbackContext {
-    sync_slot: Mutex<Option<CallbackPayload>>,
+    sync_slot: Mutex<(Option<CallbackPayload>, bool)>,
+    sync_cond: Condvar,
     mailbox: FrameMailbox<CallbackPayload>,
 }
 
 impl CallbackContext {
     fn new() -> Self {
         Self {
-            sync_slot: Mutex::new(None),
+            sync_slot: Mutex::new((None, false)),
+            sync_cond: Condvar::new(),
             mailbox: FrameMailbox::new(),
         }
     }
@@ -245,10 +250,19 @@ unsafe extern "C" fn vt_decode_callback(
     // SAFETY: NonNull::new 只做空指针检查；闭包里的 retain 依据回调契约——
     // image_buffer 在回调期间有效，retain(+1) 升级为自有引用，随状态移动/释放。
     let buffer = NonNull::new(image_buffer).map(|buf| unsafe { CFRetained::retain(buf) });
-    let payload = CallbackPayload { status, buffer };
+    let payload = CallbackPayload {
+        status,
+        buffer,
+        completed_at: Instant::now(),
+    };
     if source_frame_refcon.is_null() {
         let mut slot = ctx.sync_slot.lock().unwrap_or_else(|e| e.into_inner());
-        *slot = Some(payload);
+        let should_notify = slot.1;
+        slot.0 = Some(payload);
+        drop(slot);
+        if should_notify {
+            ctx.sync_cond.notify_one();
+        }
     } else {
         // sourceFrameRefcon 原样带回提交时的非零帧号。
         let frame_id = source_frame_refcon as usize as u64;
@@ -260,16 +274,25 @@ unsafe extern "C" fn vt_decode_callback(
 // 对 lib.rs 暴露的类型
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 一次成功解码的输出（零拷贝句柄，D1）。
-pub(crate) struct DecodeOutput {
-    /// 输出像素缓冲的不透明句柄（与 `FrameTexture::CVPixelBuffer` 同形态）。
-    /// 存活期见 [`DecompressionSession`] 的 last_output 注释：下一次
-    /// decode_frame / 会话销毁之前有效。
-    pub ptr: *mut c_void,
+/// 一次成功解码的自有输出缓冲（零拷贝句柄，D1）。
+///
+/// 由 [`VtDecoder`] 持有到下一次 `decode` / `recv_decoded` / 解码器销毁，
+/// 会话重建排空旧帧放入 `drained_outputs` 时仍保持引用计数安全存活。
+pub(crate) struct OwnedDecodeOutput {
+    buffer: CFRetained<CVPixelBuffer>,
     /// 输出宽度（像素，取自 CVPixelBuffer——VideoToolbox 是权威）。
     pub width: u32,
     /// 输出高度（像素）。
     pub height: u32,
+}
+
+// SAFETY: CFRetained<CVPixelBuffer> 的 retain/release 线程安全；解出后不做并发可变写。
+unsafe impl Send for OwnedDecodeOutput {}
+
+impl OwnedDecodeOutput {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
+        CFRetained::as_ptr(&self.buffer).as_ptr().cast::<c_void>()
+    }
 }
 
 /// 解码失败原因（lib.rs 映射到 rc_types::Error）。
@@ -292,6 +315,9 @@ impl fmt::Display for DecodeFailure {
     }
 }
 
+/// 异步流水线最大在途帧数（铁律 1：≤ 2）。
+pub(crate) const PIPELINED_MAX_IN_FLIGHT: usize = MAX_PIPELINED_IN_FLIGHT;
+
 /// 异步流水线单帧提交元数据。
 pub(crate) struct InFlightDecode {
     pub submit_id: u64,
@@ -304,8 +330,9 @@ pub(crate) struct InFlightDecode {
 pub(crate) struct PipelinedDecodeOutput {
     pub token: u64,
     pub content_is_idr: bool,
-    pub elapsed: Duration,
-    pub result: Result<DecodeOutput, DecodeFailure>,
+    pub started: Instant,
+    pub completed_at: Instant,
+    pub result: Result<OwnedDecodeOutput, DecodeFailure>,
 }
 
 /// 一个配置好的 `VTDecompressionSession`。
@@ -326,11 +353,6 @@ pub(crate) struct DecompressionSession {
     cb_ctx: Arc<CallbackContext>,
     /// 异步流水线在途元数据队列（容量 ≤ `MAX_PIPELINED_IN_FLIGHT = 2`）。
     in_flight: VecDeque<InFlightDecode>,
-    /// 上一帧输出缓冲的保活引用：零拷贝句柄（[`DecodeOutput::ptr`]）交出去
-    /// 之后由这里 hold 引用计数，直到**下一次 decode_frame / recv_decoded_frame 替换或会话销毁**
-    /// ——与 `FrameTexture` 文档「GPU 句柄在下一次采集前有效」的语义对称。
-    /// 调用方（渲染器）要跨帧持有必须自行 retain。
-    last_output: Option<CFRetained<CVPixelBuffer>>,
     /// 上一帧是否可能残留迟到/未消费邮箱条目（仅在超时或提交后异常退出时置位，
     /// 常规单帧同步路径跳过无谓的 `mailbox.clear()` 锁获取）。
     mailbox_dirty: bool,
@@ -480,7 +502,6 @@ impl DecompressionSession {
             _format_description: desc,
             cb_ctx,
             in_flight: VecDeque::with_capacity(MAX_PIPELINED_IN_FLIGHT),
-            last_output: None,
             mailbox_dirty: false,
         };
 
@@ -583,31 +604,40 @@ impl DecompressionSession {
     }
 
     fn finish_payload(
-        &mut self,
         frame_id: u64,
         payload: CallbackPayload,
-    ) -> Result<DecodeOutput, DecodeFailure> {
+    ) -> (Result<OwnedDecodeOutput, DecodeFailure>, Instant) {
+        let completed_at = payload.completed_at;
         if payload.status != 0 {
-            return Err(DecodeFailure::Callback(format!(
-                "解码回调携带错误状态: OSStatus {}（帧 {}）",
-                payload.status, frame_id
-            )));
+            return (
+                Err(DecodeFailure::Callback(format!(
+                    "解码回调携带错误状态: OSStatus {}（帧 {}）",
+                    payload.status, frame_id
+                ))),
+                completed_at,
+            );
         }
         let Some(buffer) = payload.buffer else {
-            return Err(DecodeFailure::Callback(format!(
-                "解码回调成功但没有交出输出帧（帧 {frame_id}，码流可能损坏）"
-            )));
+            return (
+                Err(DecodeFailure::Callback(format!(
+                    "解码回调成功但没有交出输出帧（帧 {frame_id}，码流可能损坏）"
+                ))),
+                completed_at,
+            );
         };
         let width = CVPixelBufferGetWidth(&buffer) as u32;
         let height = CVPixelBufferGetHeight(&buffer) as u32;
-        // SAFETY: as_ptr 借用不转移所有权；句柄交给调用方，存活期由
-        // last_output 的引用计数保证（下一次 decode/recv_decoded 前有效）。
-        let ptr = CFRetained::as_ptr(&buffer).as_ptr().cast::<c_void>();
-        self.last_output = Some(buffer);
-        Ok(DecodeOutput { ptr, width, height })
+        (
+            Ok(OwnedDecodeOutput {
+                buffer,
+                width,
+                height,
+            }),
+            completed_at,
+        )
     }
 
-    /// 等待所有在途异步帧结束并清空邮箱残留（flush / 会话切换 / 切回同步前调用）。
+    /// 等待所有在途异步帧结束并清空邮箱残留（flush / 切回同步 / 异常清理前调用）。
     pub(crate) fn wait_and_clear(&mut self) {
         if !self.in_flight.is_empty() || self.mailbox_dirty {
             // SAFETY: session 有效，等待全部在途异步回调完成。
@@ -616,13 +646,61 @@ impl DecompressionSession {
             }
             self.in_flight.clear();
             self.cb_ctx.mailbox.clear();
-            self.cb_ctx
-                .sync_slot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
+            {
+                let mut g = self
+                    .cb_ctx
+                    .sync_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                g.0.take();
+                g.1 = false;
+            }
             self.mailbox_dirty = false;
         }
+    }
+
+    /// 异步流水线重建会话前排空旧会话全部在途帧，保留其 FIFO 输出供 `recv_decoded` 顺序交付，
+    /// 避免上层 `ControllerPipeline` 与底层在途计数失步。
+    pub(crate) fn drain_all_in_flight(&mut self) -> Vec<PipelinedDecodeOutput> {
+        let mut drained = Vec::with_capacity(self.in_flight.len());
+        if self.in_flight.is_empty() {
+            if self.mailbox_dirty {
+                self.wait_and_clear();
+            }
+            return drained;
+        }
+        // SAFETY: session 有效，等待旧会话全部在途异步回调完成。
+        unsafe {
+            raw::VTDecompressionSessionWaitForAsynchronousFrames(self.session.as_ptr());
+        }
+        let now = Instant::now();
+        while let Some(meta) = self.in_flight.pop_front() {
+            let (result, completed_at) =
+                if let Some(payload) = self.cb_ctx.mailbox.take(meta.submit_id, now) {
+                    Self::finish_payload(meta.submit_id, payload)
+                } else {
+                    (Err(DecodeFailure::Timeout), Instant::now())
+                };
+            drained.push(PipelinedDecodeOutput {
+                token: meta.token,
+                content_is_idr: meta.content_is_idr,
+                started: meta.started,
+                completed_at,
+                result,
+            });
+        }
+        self.cb_ctx.mailbox.clear();
+        {
+            let mut g = self
+                .cb_ctx
+                .sync_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            g.0.take();
+            g.1 = false;
+        }
+        self.mailbox_dirty = false;
+        drained
     }
 
     /// 当前异步流水线在途帧数（`0..=2`）。
@@ -630,14 +708,19 @@ impl DecompressionSession {
         self.in_flight.len()
     }
 
+    /// 当前异步流水线中是否存在尚未回调的 IDR。
+    pub(crate) fn has_idr_in_flight(&self) -> bool {
+        self.in_flight.iter().any(|f| f.content_is_idr)
+    }
+
     /// 同步解码一帧：优先走 `decodeFlags = 0` 同步内联快路径（免 Condvar 唤醒与 VecDeque 扫描）；
-    /// 仅当 VT 意外走异步分支时回退至帧序邮箱有界等待。
+    /// 仅当 VT 意外走异步分支时以 `sync_cond.wait_timeout` 有界等待。
     pub(crate) fn decode_frame(
         &mut self,
         avcc: &[u8],
         frame_id: u64,
         wait: Duration,
-    ) -> Result<DecodeOutput, DecodeFailure> {
+    ) -> Result<OwnedDecodeOutput, DecodeFailure> {
         promote_thread_qos_once();
         if !self.in_flight.is_empty() || self.mailbox_dirty {
             self.wait_and_clear();
@@ -657,43 +740,63 @@ impl DecompressionSession {
             )
         };
         if status != 0 {
+            {
+                let mut g = self
+                    .cb_ctx
+                    .sync_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                g.0.take();
+                g.1 = false;
+            }
+            self.mailbox_dirty = true;
             return Err(DecodeFailure::Failed(format!(
                 "VTDecompressionSessionDecodeFrame 失败: OSStatus {status}"
             )));
         }
 
         // Apple Silicon 真机实证 decodeFlags = 0 时回调 100% 同步内联完成。
-        let inline_payload = self
-            .cb_ctx
-            .sync_slot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let inline_payload = {
+            let mut g = self
+                .cb_ctx
+                .sync_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            g.0.take()
+        };
         if let Some(payload) = inline_payload {
-            return self.finish_payload(frame_id, payload);
+            return Self::finish_payload(frame_id, payload).0;
         }
 
-        // 防御性兜底：若驱动仍返回异步标记，等待帧完成后再读取 sync_slot。
+        // 防御性兜底：若驱动仍返回异步标记，在 sync_cond 上做严格有界等待（不无界阻塞）。
         if info_flags & K_VT_DECODE_INFO_ASYNCHRONOUS != 0 {
             let deadline = Instant::now()
                 .checked_add(wait)
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(1));
-            // SAFETY: session 有效。
-            unsafe {
-                raw::VTDecompressionSessionWaitForAsynchronousFrames(self.session.as_ptr());
-            }
-            if Instant::now() >= deadline {
-                self.mailbox_dirty = true;
-                return Err(DecodeFailure::Timeout);
-            }
-            let fallback_payload = self
-                .cb_ctx
-                .sync_slot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
+            let fallback_payload = {
+                let mut g = self
+                    .cb_ctx
+                    .sync_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                g.1 = true;
+                while g.0.is_none() {
+                    let remain = deadline.saturating_duration_since(Instant::now());
+                    if remain.is_zero() {
+                        break;
+                    }
+                    let (next_g, _) = self
+                        .cb_ctx
+                        .sync_cond
+                        .wait_timeout(g, remain)
+                        .unwrap_or_else(|e| e.into_inner());
+                    g = next_g;
+                }
+                g.1 = false;
+                g.0.take()
+            };
             if let Some(payload) = fallback_payload {
-                return self.finish_payload(frame_id, payload);
+                return Self::finish_payload(frame_id, payload).0;
             }
         }
         self.mailbox_dirty = true;
@@ -715,8 +818,7 @@ impl DecompressionSession {
         }
         promote_thread_qos_once();
         if self.mailbox_dirty && self.in_flight.is_empty() {
-            self.cb_ctx.mailbox.clear();
-            self.mailbox_dirty = false;
+            self.wait_and_clear();
         }
         // 非零 refcon 确保回调路由到异步 mailbox（0 保留给同步快路径）。
         let refcon_id = submit_id.max(1);
@@ -735,6 +837,7 @@ impl DecompressionSession {
             )
         };
         if status != 0 {
+            self.mailbox_dirty = true;
             return Err(DecodeFailure::Failed(format!(
                 "VTDecompressionSessionDecodeFrame(async) 失败: OSStatus {status}"
             )));
@@ -763,12 +866,12 @@ impl DecompressionSession {
         };
         let payload = self.cb_ctx.mailbox.take(front_id, deadline)?;
         let meta = self.in_flight.pop_front()?;
-        let elapsed = meta.started.elapsed();
-        let result = self.finish_payload(meta.submit_id, payload);
+        let (result, completed_at) = Self::finish_payload(meta.submit_id, payload);
         Some(PipelinedDecodeOutput {
             token: meta.token,
             content_is_idr: meta.content_is_idr,
-            elapsed,
+            started: meta.started,
+            completed_at,
             result,
         })
     }
@@ -785,11 +888,15 @@ impl Drop for DecompressionSession {
             raw::VTDecompressionSessionWaitForAsynchronousFrames(self.session.as_ptr());
             raw::VTDecompressionSessionInvalidate(self.session.as_ptr());
             self.cb_ctx.mailbox.clear();
-            self.cb_ctx
-                .sync_slot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
+            {
+                let mut g = self
+                    .cb_ctx
+                    .sync_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                g.0.take();
+                g.1 = false;
+            }
             raw::CFRelease(self.session.as_ptr().cast_const());
         }
         self.in_flight.clear();
