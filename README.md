@@ -18,10 +18,18 @@ RabbitControl 的 Apple 平台(iOS/macOS)媒体库:**VideoToolbox 硬件 H.264 �
 
 ## 本地构建
 
-默认从 GitHub `TokenBoom/rabbitcontrol-core` 拉取 `tag = "v0.1.15"`：
+默认直接从 GitHub `TokenBoom/rabbitcontrol-core` 按 `Cargo.toml` 钉住的 git tag 拉取（iOS cfg 已原生合入 core，无需仓外补丁）：
 
 ```sh
 cargo build -p rc-media-apple --target aarch64-apple-ios-sim
+```
+
+构建含真机 (`aarch64-apple-ios`) 与通用模拟器 (`aarch64-apple-ios-sim` + `x86_64-apple-ios` 经 `lipo` 合并) 的 `RabbitControlCore.xcframework`，并自动产出 `RabbitControlCore.xcframework.tar.gz` 与 `SHA256SUMS.txt`：
+
+```sh
+./scripts/build-xcframework.sh build
+# 如仅需 arm64 模拟器切片可显式关闭 x86_64：
+RC_INCLUDE_X86_64_SIM=0 ./scripts/build-xcframework.sh build
 ```
 
 > 注：`crates/rc-media-apple/examples/e2e_session.rs` 依赖尚未合入 `rabbitcontrol-core` `main` 的 `rc-mobile-ffi`，默认通过 `autoexamples = false` 跳过编译。

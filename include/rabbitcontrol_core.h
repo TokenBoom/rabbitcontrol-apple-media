@@ -14,6 +14,12 @@ extern "C" {
 /// 返回核心库版本字符串。返回值由 Rust 侧分配,用后必须 `rc_string_free` 释放。
 char *rc_core_version(void);
 
+/// 返回核心库完整构建与协议版本元数据 JSON 字符串(camelCase 字段:
+/// coreVersion / gitCommit / buildTimestamp / sessionProtocolVersion /
+/// punchVersion / beaconVersion / abiVersion)。
+/// 返回值由 Rust 侧分配,用后必须 `rc_string_free` 释放。
+char *rc_core_build_info_json(void);
+
 /// 释放 Rust 侧分配的字符串(NULL 安全)。
 void rc_string_free(char *ptr);
 

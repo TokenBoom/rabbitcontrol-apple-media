@@ -374,6 +374,7 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
                     allow_remote_assist: false,
                     allow_remote_control: Some(false),
                     dynamic_lan_discovery: true,
+                    upnp_enabled: false,
                 },
                 |_| {},
             );

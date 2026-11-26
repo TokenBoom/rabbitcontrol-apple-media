@@ -29,11 +29,17 @@ struct PlaybackProvider;
 
 #[cfg(target_os = "ios")]
 impl rc_audio::AudioBackendProvider for PlaybackProvider {
-    fn create_system_audio_capture(&self) -> std::result::Result<Box<dyn rc_audio::AudioCapture>, String> {
+    fn create_system_audio_capture(
+        &self,
+    ) -> std::result::Result<Box<dyn rc_audio::AudioCapture>, String> {
         Err("controller does not capture local audio".into())
     }
 
-    fn create_audio_player(&self, rate: u32, channels: u8) -> std::result::Result<Box<dyn rc_audio::AudioPlayer>, String> {
+    fn create_audio_player(
+        &self,
+        rate: u32,
+        channels: u8,
+    ) -> std::result::Result<Box<dyn rc_audio::AudioPlayer>, String> {
         Ok(Box::new(playback::AppleAudioPlayer::new(rate, channels)?))
     }
 }

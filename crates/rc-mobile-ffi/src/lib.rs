@@ -22,7 +22,18 @@ pub mod tools;
 /// 返回核心库版本字符串(调用方负责用 `rc_string_free` 释放)。
 #[no_mangle]
 pub extern "C" fn rc_core_version() -> *mut c_char {
-    to_c_string(env!("CARGO_PKG_VERSION").to_string())
+    to_c_string(rc_client_core::version::core_version().to_string())
+}
+
+/// 返回核心库完整构建与协议版本元数据 JSON 字符串(调用方负责用 `rc_string_free` 释放)。
+///
+/// 字段与 `rc_client_core::version::CoreBuildInfo` 一致(camelCase):
+/// `coreVersion` / `gitCommit` / `buildTimestamp` / `sessionProtocolVersion` /
+/// `punchVersion` / `beaconVersion` / `abiVersion`。
+#[no_mangle]
+pub extern "C" fn rc_core_build_info_json() -> *mut c_char {
+    let info = rc_client_core::version::core_build_info();
+    to_c_string(serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string()))
 }
 
 /// 释放 Rust 侧分配的字符串。传入空指针安全无操作。
@@ -115,8 +126,61 @@ mod tests {
         let ptr = rc_core_version();
         assert!(!ptr.is_null());
         let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_string();
-        assert!(!s.is_empty());
         unsafe { rc_string_free(ptr) };
+        assert_eq!(s, rc_client_core::version::core_version());
+        assert_eq!(s, "0.1.26");
+    }
+
+    #[test]
+    fn core_build_info_json_roundtrip() {
+        let ptr = rc_core_build_info_json();
+        assert!(!ptr.is_null());
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_string();
+        unsafe { rc_string_free(ptr) };
+
+        let expected = rc_client_core::version::core_build_info();
+        let value: serde_json::Value =
+            serde_json::from_str(&s).expect("rc_core_build_info_json 必须返回合法 JSON");
+        let obj = value
+            .as_object()
+            .expect("rc_core_build_info_json 必须是 JSON 对象");
+        assert_eq!(
+            obj.get("coreVersion").and_then(|v| v.as_str()),
+            Some("0.1.26")
+        );
+        assert_eq!(
+            obj.get("coreVersion").and_then(|v| v.as_str()),
+            Some(expected.core_version)
+        );
+        assert_eq!(
+            obj.get("gitCommit").and_then(|v| v.as_str()),
+            Some(expected.git_commit)
+        );
+        assert_eq!(
+            obj.get("buildTimestamp").and_then(|v| v.as_str()),
+            Some(expected.build_timestamp)
+        );
+        assert_eq!(
+            obj.get("sessionProtocolVersion").and_then(|v| v.as_u64()),
+            Some(u64::from(expected.session_protocol_version))
+        );
+        assert_eq!(
+            obj.get("punchVersion").and_then(|v| v.as_u64()),
+            Some(u64::from(expected.punch_version))
+        );
+        assert_eq!(
+            obj.get("beaconVersion").and_then(|v| v.as_u64()),
+            Some(u64::from(expected.beacon_version))
+        );
+        assert_eq!(
+            obj.get("abiVersion").and_then(|v| v.as_u64()),
+            Some(u64::from(expected.abi_version))
+        );
+
+        let leaked: &'static str = Box::leak(s.into_boxed_str());
+        let parsed: rc_client_core::version::CoreBuildInfo =
+            serde_json::from_str(leaked).expect("反序列化 CoreBuildInfo");
+        assert_eq!(parsed, expected);
     }
 
     #[test]

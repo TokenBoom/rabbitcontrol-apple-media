@@ -84,6 +84,16 @@ pub unsafe extern "C" fn rc_apple_clipboard_send(json: *const c_char) -> i32 {
     1
 }
 
+#[no_mangle]
+pub extern "C" fn rc_apple_clipboard_take() -> *mut c_char {
+    let Some(slot) = only_board() else {
+        return std::ptr::null_mut();
+    };
+    let text = slot.lock().unwrap().received.take();
+    text.map(|v| super::to_c_string(serde_json::to_string(&v).unwrap()))
+        .unwrap_or(std::ptr::null_mut())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,14 +111,4 @@ mod tests {
             Some("remote")
         );
     }
-}
-
-#[no_mangle]
-pub extern "C" fn rc_apple_clipboard_take() -> *mut c_char {
-    let Some(slot) = only_board() else {
-        return std::ptr::null_mut();
-    };
-    let text = slot.lock().unwrap().received.take();
-    text.map(|v| super::to_c_string(serde_json::to_string(&v).unwrap()))
-        .unwrap_or(std::ptr::null_mut())
 }
