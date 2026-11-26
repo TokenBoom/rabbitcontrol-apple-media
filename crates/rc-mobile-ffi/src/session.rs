@@ -10,10 +10,15 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use rc_client_core::session_bridge::{SessionCommand, SessionHandle, UiSessionConfig};
+use rc_client_core::session_bridge::{
+    SessionCommand, SessionHandle, SessionUpdate, UiSessionConfig,
+};
+use rc_client_core::ui_error::{classify_session_reason, tool_forbidden_ui_error};
 use rc_input::InputEvent;
+use rc_session::ToolPermissions;
 use serde::Deserialize;
 
+use crate::ui_error::{normalize_ui_error_for_ios, FfiError, MOBILE_ERROR_PLATFORM};
 use crate::{read_c_str, to_c_string};
 
 fn sessions() -> &'static Mutex<HashMap<u64, SessionHandle>> {
@@ -77,21 +82,57 @@ fn default_bitrate() -> u32 {
     8_000_000
 }
 
+/// 将工具通道权限序列化为与 `SessionUpdate::ToolPermissionsUpdated.data` 对齐的 JSON 对象。
+pub(crate) fn tool_permissions_value(perms: ToolPermissions) -> serde_json::Value {
+    serde_json::json!({
+        "allow_file_transfer": perms.allow_file_transfer,
+        "allow_terminal": perms.allow_terminal,
+        "allow_port_map": perms.allow_port_map,
+    })
+}
+
+/// 将 `SessionUpdate` 中附带的结构化错误统一按 iOS 平台归一化，并保证 `Ended` 始终携带 `ui_error`。
+pub(crate) fn normalize_session_update_for_ios(update: SessionUpdate) -> SessionUpdate {
+    match update {
+        SessionUpdate::Ended {
+            reason,
+            recoverable,
+            ui_error,
+        } => {
+            let normalized = match ui_error {
+                Some(ui) => normalize_ui_error_for_ios(ui),
+                None => classify_session_reason(&reason, MOBILE_ERROR_PLATFORM),
+            };
+            SessionUpdate::Ended {
+                reason,
+                recoverable,
+                ui_error: Some(normalized),
+            }
+        }
+        SessionUpdate::ToolPermissionDenied { channel, ui_error } => {
+            SessionUpdate::ToolPermissionDenied {
+                channel,
+                ui_error: tool_forbidden_ui_error(channel, MOBILE_ERROR_PLATFORM, ui_error.detail),
+            }
+        }
+        other => other,
+    }
+}
+
 /// 打开会话。返回 `{"session_id": N}` 或错误信封。
 ///
 /// 当前切片:直连模式(含 LAN 直连),信令/中继路由待后续切片。
 #[no_mangle]
 pub extern "C" fn rc_session_open(json: *const c_char) -> *mut c_char {
-    let result: Result<u64, String> = (|| {
+    let result: Result<u64, FfiError> = (|| {
         let Some(s) = read_c_str(json) else {
-            return Err("缺少 JSON 参数".to_string());
+            return Err(FfiError::invalid_json("缺少 JSON 参数"));
         };
-        let req: OpenRequest =
-            serde_json::from_str(s).map_err(|e| format!("JSON 参数解析失败: {e}"))?;
-        let addr: SocketAddr = req
-            .connect_addr
-            .parse()
-            .map_err(|_| format!("connect_addr 非法: {}", req.connect_addr))?;
+        let req: OpenRequest = serde_json::from_str(s)
+            .map_err(|e| FfiError::invalid_json(format!("JSON 参数解析失败: {e}")))?;
+        let addr: SocketAddr = req.connect_addr.parse().map_err(|_| {
+            FfiError::invalid_input(format!("connect_addr 非法: {}", req.connect_addr))
+        })?;
         let cfg = UiSessionConfig {
             connect_addr: addr,
             password: req.password,
@@ -110,42 +151,58 @@ pub extern "C" fn rc_session_open(json: *const c_char) -> *mut c_char {
     })();
     match result {
         Ok(id) => to_c_string(serde_json::json!({ "session_id": id }).to_string()),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }
 
-/// 排空会话状态更新队列。输入 `{"session_id": N}`;返回 `{"updates": [...]}`。
-/// `updates` 元素为 `SessionUpdate` JSON(带 `kind` 标签)。
+/// 排空会话状态更新队列。输入 `{"session_id": N}`;
+/// 返回 `{"updates": [...], "running": bool, "tool_permissions": {...}}`。
+/// `updates` 元素为 `SessionUpdate` JSON(带 `kind` 标签，含 `tool_permissions_updated`、
+/// `tool_permission_denied` 与带 `ui_error` 的 `ended`)。
 #[no_mangle]
 pub extern "C" fn rc_session_poll(json: *const c_char) -> *mut c_char {
     #[derive(Deserialize)]
     struct Req {
         session_id: u64,
     }
-    let result: Result<serde_json::Value, String> = (|| {
+    let result: Result<serde_json::Value, FfiError> = (|| {
         let Some(s) = read_c_str(json) else {
-            return Err("缺少 JSON 参数".to_string());
+            return Err(FfiError::invalid_json("缺少 JSON 参数"));
         };
-        let req: Req = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        let req: Req =
+            serde_json::from_str(s).map_err(|e| FfiError::invalid_json(e.to_string()))?;
         let sessions = lock_sessions();
         let Some(handle) = sessions.get(&req.session_id) else {
-            return Err("会话不存在".to_string());
+            return Err(FfiError::session_not_found());
         };
         let mut updates = Vec::new();
         while let Some(update) = handle.try_recv_update() {
-            if let Ok(v) = serde_json::to_value(&update) {
+            let normalized = normalize_session_update_for_ios(update);
+            if let Ok(v) = serde_json::to_value(&normalized) {
                 updates.push(v);
             }
         }
         Ok(serde_json::json!({
             "updates": updates,
             "running": handle.is_running(),
+            "tool_permissions": tool_permissions_value(handle.tool_permissions()),
         }))
     })();
     match result {
         Ok(v) => to_c_string(v.to_string()),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
+}
+
+/// 查询指定远控会话当前被控端通告的工具通道权限 JSON:
+/// `{"allow_file_transfer": bool, "allow_terminal": bool, "allow_port_map": bool}`。
+/// 会话不存在时返回带 `ui_error`（`session.not_found`）的标准错误信封。
+#[no_mangle]
+pub extern "C" fn rc_session_tool_permissions_json(session_id: u64) -> *mut c_char {
+    let Some(perms) = with_session(session_id, SessionHandle::tool_permissions) else {
+        return FfiError::session_not_found().into_c_string();
+    };
+    to_c_string(tool_permissions_value(perms).to_string())
 }
 
 /// 发送低频控制指令。输入 `{"session_id": N, "command": {...}}`,
@@ -157,21 +214,22 @@ pub extern "C" fn rc_session_command(json: *const c_char) -> *mut c_char {
         session_id: u64,
         command: SessionCommand,
     }
-    let result: Result<(), String> = (|| {
+    let result: Result<(), FfiError> = (|| {
         let Some(s) = read_c_str(json) else {
-            return Err("缺少 JSON 参数".to_string());
+            return Err(FfiError::invalid_json("缺少 JSON 参数"));
         };
-        let req: Req = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        let req: Req =
+            serde_json::from_str(s).map_err(|e| FfiError::invalid_json(e.to_string()))?;
         let sessions = lock_sessions();
         let Some(handle) = sessions.get(&req.session_id) else {
-            return Err("会话不存在".to_string());
+            return Err(FfiError::session_not_found());
         };
         handle.send(req.command);
         Ok(())
     })();
     match result {
         Ok(()) => to_c_string(r#"{"ok":true}"#.to_string()),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }
 
@@ -203,11 +261,12 @@ pub extern "C" fn rc_session_input(json: *const c_char) -> *mut c_char {
         #[serde(default)]
         modifiers: u8,
     }
-    let result: Result<(), String> = (|| {
+    let result: Result<(), FfiError> = (|| {
         let Some(s) = read_c_str(json) else {
-            return Err("缺少 JSON 参数".to_string());
+            return Err(FfiError::invalid_json("缺少 JSON 参数"));
         };
-        let req: Req = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        let req: Req =
+            serde_json::from_str(s).map_err(|e| FfiError::invalid_json(e.to_string()))?;
         let ev = match req.kind.as_str() {
             "mouse_move" => InputEvent::MouseMove { x: req.x, y: req.y },
             "mouse_button" => {
@@ -215,7 +274,9 @@ pub extern "C" fn rc_session_input(json: *const c_char) -> *mut c_char {
                     Some("left") => rc_input::MouseButton::Left,
                     Some("right") => rc_input::MouseButton::Right,
                     Some("middle") => rc_input::MouseButton::Middle,
-                    other => return Err(format!("button 非法: {other:?}")),
+                    other => {
+                        return Err(FfiError::invalid_input(format!("button 非法: {other:?}")));
+                    }
                 };
                 InputEvent::MouseButton {
                     button,
@@ -231,18 +292,18 @@ pub extern "C" fn rc_session_input(json: *const c_char) -> *mut c_char {
                 pressed: req.pressed,
                 modifiers: req.modifiers,
             },
-            other => return Err(format!("kind 非法: {other}")),
+            other => return Err(FfiError::invalid_input(format!("kind 非法: {other}"))),
         };
         let sessions = lock_sessions();
         let Some(handle) = sessions.get(&req.session_id) else {
-            return Err("会话不存在".to_string());
+            return Err(FfiError::session_not_found());
         };
         handle.send_input(ev);
         Ok(())
     })();
     match result {
         Ok(()) => to_c_string(r#"{"ok":true}"#.to_string()),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }
 
@@ -253,11 +314,12 @@ pub extern "C" fn rc_session_close(json: *const c_char) -> *mut c_char {
     struct Req {
         session_id: u64,
     }
-    let result: Result<(), String> = (|| {
+    let result: Result<(), FfiError> = (|| {
         let Some(s) = read_c_str(json) else {
-            return Err("缺少 JSON 参数".to_string());
+            return Err(FfiError::invalid_json("缺少 JSON 参数"));
         };
-        let req: Req = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        let req: Req =
+            serde_json::from_str(s).map_err(|e| FfiError::invalid_json(e.to_string()))?;
         let Some(handle) = lock_sessions().remove(&req.session_id) else {
             return Ok(()); // 已关闭,幂等
         };
@@ -266,6 +328,6 @@ pub extern "C" fn rc_session_close(json: *const c_char) -> *mut c_char {
     })();
     match result {
         Ok(()) => to_c_string(r#"{"ok":true}"#.to_string()),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }

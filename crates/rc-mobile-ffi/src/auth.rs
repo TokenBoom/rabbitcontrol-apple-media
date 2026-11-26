@@ -8,6 +8,7 @@ use std::os::raw::c_char;
 use rc_client_core::auth_client::{AuthClientError, AuthHttpClient, LoginRequest, RegisterRequest};
 use serde::Deserialize;
 
+use crate::ui_error::FfiError;
 use crate::{read_c_str, to_c_string};
 
 /// FFI 输入:服务器连接参数(内嵌于每个请求)。
@@ -56,36 +57,25 @@ struct TokenRequest {
     refresh_token: Option<String>,
 }
 
-fn parse_json<'a, T: Deserialize<'a>>(ptr: *const c_char) -> Result<T, String> {
+fn parse_json<'a, T: Deserialize<'a>>(ptr: *const c_char) -> Result<T, FfiError> {
     let Some(s) = read_c_str(ptr) else {
-        return Err("缺少 JSON 参数".to_string());
+        return Err(FfiError::invalid_json("缺少 JSON 参数"));
     };
-    serde_json::from_str(s).map_err(|e| format!("JSON 参数解析失败: {e}"))
+    serde_json::from_str(s).map_err(|e| FfiError::invalid_json(format!("JSON 参数解析失败: {e}")))
 }
 
-fn error_json(err: &AuthClientError) -> String {
-    let kind = if err.is_unauthorized() {
-        "unauthorized"
-    } else if err.is_token_reuse() {
-        "token_reuse"
-    } else if err.is_password_change_required() {
-        "password_change_required"
-    } else if err.is_registration_disabled() {
-        "registration_disabled"
-    } else {
-        "other"
-    };
-    serde_json::json!({ "error": err.to_string(), "kind": kind }).to_string()
+pub(crate) fn error_json(err: &AuthClientError) -> String {
+    FfiError::from_auth(err).to_json_string()
 }
 
-fn client(server: &ServerParams) -> Result<AuthHttpClient, String> {
+fn client(server: &ServerParams) -> Result<AuthHttpClient, FfiError> {
     AuthHttpClient::new(
         server.server_host.clone(),
         server.api_port,
         server.use_https,
         server.ca_cert_pem.clone(),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| FfiError::from_auth(&e))
 }
 
 fn respond<T: serde::Serialize>(result: Result<T, AuthClientError>) -> *mut c_char {
@@ -106,12 +96,11 @@ pub extern "C" fn rc_server_probe(json: *const c_char) -> *mut c_char {
         #[serde(default)]
         expected_ca_fingerprint_sha256: Option<String>,
     }
-    let result: Result<Result<_, AuthClientError>, String> = parse_json::<ProbeRequest>(json)
-        .map(|req| {
+    let result: Result<Result<_, AuthClientError>, FfiError> = parse_json::<ProbeRequest>(json)
+        .and_then(|req| {
             client(&req.server)
                 .map(|c| c.probe_server(req.expected_ca_fingerprint_sha256.as_deref()))
-        })
-        .and_then(|r| r);
+        });
     match result {
         Ok(Ok(r)) => {
             let out = serde_json::json!({
@@ -124,7 +113,7 @@ pub extern "C" fn rc_server_probe(json: *const c_char) -> *mut c_char {
             to_c_string(out.to_string())
         }
         Ok(Err(e)) => to_c_string(error_json(&e)),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }
 
@@ -147,7 +136,7 @@ pub extern "C" fn rc_auth_login(json: *const c_char) -> *mut c_char {
     });
     match result {
         Ok(r) => respond(r),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }
 
@@ -171,7 +160,7 @@ pub extern "C" fn rc_auth_register(json: *const c_char) -> *mut c_char {
     });
     match result {
         Ok(r) => respond(r),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }
 
@@ -181,12 +170,12 @@ pub extern "C" fn rc_auth_refresh(json: *const c_char) -> *mut c_char {
     let result = parse_json::<TokenRequest>(json).and_then(|req| {
         let token = req
             .refresh_token
-            .ok_or_else(|| "缺少 refresh_token".to_string())?;
+            .ok_or_else(|| FfiError::invalid_input("缺少 refresh_token"))?;
         client(&req.server).map(|c| c.refresh(&token))
     });
     match result {
         Ok(r) => respond(r),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }
 
@@ -194,14 +183,18 @@ pub extern "C" fn rc_auth_refresh(json: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn rc_auth_logout(json: *const c_char) -> *mut c_char {
     let result = parse_json::<TokenRequest>(json).and_then(|req| {
-        let access = req.access_token.ok_or("缺少 access_token")?;
-        let refresh = req.refresh_token.ok_or("缺少 refresh_token")?;
+        let access = req
+            .access_token
+            .ok_or_else(|| FfiError::invalid_input("缺少 access_token"))?;
+        let refresh = req
+            .refresh_token
+            .ok_or_else(|| FfiError::invalid_input("缺少 refresh_token"))?;
         Ok(client(&req.server)?.logout(&access, Some(&refresh), None))
     });
     match result {
         Ok(Ok(())) => to_c_string(r#"{"ok":true}"#.into()),
         Ok(Err(error)) => to_c_string(error_json(&error)),
-        Err(error) => to_c_string(serde_json::json!({"error":error}).to_string()),
+        Err(error) => error.into_c_string(),
     }
 }
 
@@ -211,12 +204,12 @@ pub extern "C" fn rc_auth_list_devices(json: *const c_char) -> *mut c_char {
     let result = parse_json::<TokenRequest>(json).and_then(|req| {
         let token = req
             .access_token
-            .ok_or_else(|| "缺少 access_token".to_string())?;
+            .ok_or_else(|| FfiError::invalid_input("缺少 access_token"))?;
         client(&req.server).map(|c| c.list_my_devices(&token))
     });
     match result {
         Ok(r) => respond(r),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }
 
@@ -238,7 +231,7 @@ pub extern "C" fn rc_auth_change_password(json: *const c_char) -> *mut c_char {
     });
     match result {
         Ok(r) => respond(r),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }
 
@@ -282,6 +275,6 @@ fn device_op(json: *const c_char, is_remove: bool) -> *mut c_char {
     match result {
         Ok(Ok(v)) => to_c_string(v.to_string()),
         Ok(Err(e)) => to_c_string(error_json(&e)),
-        Err(e) => to_c_string(serde_json::json!({ "error": e, "kind": "other" }).to_string()),
+        Err(e) => e.into_c_string(),
     }
 }

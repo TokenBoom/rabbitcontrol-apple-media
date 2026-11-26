@@ -5,16 +5,76 @@
 
 use std::os::raw::c_char;
 
+use rc_client_core::ui_error::{codes, tool_forbidden_ui_error};
+use rc_session::{ToolPermissions, TOOL_CHANNEL_FILE, TOOL_CHANNEL_PORTMAP, TOOL_CHANNEL_TERMINAL};
 use serde::Deserialize;
 
+use crate::ui_error::{FfiError, MOBILE_ERROR_PLATFORM};
 use crate::{read_c_str, to_c_string};
-
-fn err_json(e: impl std::fmt::Display) -> *mut c_char {
-    to_c_string(serde_json::json!({ "error": e.to_string() }).to_string())
-}
 
 fn ok_json(v: serde_json::Value) -> *mut c_char {
     to_c_string(v.to_string())
+}
+
+fn classify_tool_error(op: &ToolOp, perms: ToolPermissions, msg: String) -> FfiError {
+    if msg.contains("请先建立远控会话") {
+        return FfiError::resolved(codes::SESSION_DISCONNECTED, msg);
+    }
+    match op {
+        ToolOp::FileListRemote { .. }
+        | ToolOp::FileMkdir { .. }
+        | ToolOp::FileUpload { .. }
+        | ToolOp::FileDownload { .. } => {
+            if !perms.allow_file_transfer || msg.contains("禁用工具") {
+                let ui_error = tool_forbidden_ui_error(
+                    TOOL_CHANNEL_FILE,
+                    MOBILE_ERROR_PLATFORM,
+                    Some(msg.clone()),
+                );
+                FfiError::from_ui_error(msg, "other", ui_error)
+            } else {
+                FfiError::resolved(codes::TOOL_FILE_TRANSFER_FAILED, msg)
+            }
+        }
+        ToolOp::FileCancel { .. } | ToolOp::FileClearFinished => {
+            FfiError::resolved(codes::TOOL_FILE_TRANSFER_FAILED, msg)
+        }
+        ToolOp::TerminalOpen { .. }
+        | ToolOp::TerminalList
+        | ToolOp::TerminalAttach { .. }
+        | ToolOp::TerminalDetach { .. }
+        | ToolOp::TerminalInput { .. }
+        | ToolOp::TerminalResize { .. }
+        | ToolOp::TerminalClose { .. } => {
+            if !perms.allow_terminal || msg.contains("禁用工具") {
+                let ui_error = tool_forbidden_ui_error(
+                    TOOL_CHANNEL_TERMINAL,
+                    MOBILE_ERROR_PLATFORM,
+                    Some(msg.clone()),
+                );
+                FfiError::from_ui_error(msg, "other", ui_error)
+            } else if msg.contains("上限") || msg.contains("最多") {
+                FfiError::resolved(codes::TOOL_TERMINAL_LIMIT_REACHED, msg)
+            } else {
+                FfiError::resolved(codes::TOOL_TERMINAL_FAILED, msg)
+            }
+        }
+        ToolOp::PortmapList
+        | ToolOp::PortmapAdd { .. }
+        | ToolOp::PortmapRemove { .. }
+        | ToolOp::PortmapToggle { .. } => {
+            if !perms.allow_port_map || msg.contains("禁用工具") {
+                let ui_error = tool_forbidden_ui_error(
+                    TOOL_CHANNEL_PORTMAP,
+                    MOBILE_ERROR_PLATFORM,
+                    Some(msg.clone()),
+                );
+                FfiError::from_ui_error(msg, "other", ui_error)
+            } else {
+                FfiError::resolved(codes::TOOL_PORTMAP_BIND_FAILED, msg)
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -90,40 +150,43 @@ fn default_true() -> bool {
     true
 }
 
-/// 工具写操作统一入口。输入 `{"op": "...", ...}`,返回 `{"ok": true, ...}` 或 `{"error": ...}`。
+/// 工具写操作统一入口。输入 `{"op": "...", ...}`,返回 `{"ok": true, ...}` 或带 `ui_error` 的错误信封。
 #[no_mangle]
 pub extern "C" fn rc_tools_call(session_id: u64, json: *const c_char) -> *mut c_char {
-    let result: Result<serde_json::Value, String> = (|| {
+    let result: Result<serde_json::Value, FfiError> = (|| {
         let Some(s) = read_c_str(json) else {
-            return Err("缺少 JSON 参数".to_string());
+            return Err(FfiError::invalid_json("缺少 JSON 参数"));
         };
-        let op: ToolOp = serde_json::from_str(s).map_err(|e| format!("参数解析: {e}"))?;
-        let tools = crate::session::with_session(session_id, |h| h.tools()).ok_or("会话不存在")?;
-        match op {
+        let op: ToolOp = serde_json::from_str(s)
+            .map_err(|e| FfiError::invalid_json(format!("参数解析: {e}")))?;
+        let (tools, perms) =
+            crate::session::with_session(session_id, |h| (h.tools(), h.tool_permissions()))
+                .ok_or_else(FfiError::session_not_found)?;
+        let exec: Result<serde_json::Value, String> = (|| match &op {
             ToolOp::FileListRemote { path } => {
-                tools.file_list_remote(path)?;
+                tools.file_list_remote(path.clone())?;
                 Ok(serde_json::json!({ "ok": true }))
             }
             ToolOp::FileMkdir { parent, name } => {
-                tools.file_mkdir_remote(parent, name)?;
+                tools.file_mkdir_remote(parent.clone(), name.clone())?;
                 Ok(serde_json::json!({ "ok": true }))
             }
             ToolOp::FileUpload {
                 local_path,
                 remote_dir,
             } => {
-                let id = tools.file_upload(&local_path, &remote_dir)?;
+                let id = tools.file_upload(local_path, remote_dir)?;
                 Ok(serde_json::json!({ "ok": true, "transfer_id": id }))
             }
             ToolOp::FileDownload {
                 remote_path,
                 local_dir,
             } => {
-                let id = tools.file_download(&remote_path, &local_dir)?;
+                let id = tools.file_download(remote_path, local_dir)?;
                 Ok(serde_json::json!({ "ok": true, "transfer_id": id }))
             }
             ToolOp::FileCancel { id } => {
-                tools.file_cancel(id)?;
+                tools.file_cancel(*id)?;
                 Ok(serde_json::json!({ "ok": true }))
             }
             ToolOp::FileClearFinished => {
@@ -131,7 +194,7 @@ pub extern "C" fn rc_tools_call(session_id: u64, json: *const c_char) -> *mut c_
                 Ok(serde_json::json!({ "ok": true }))
             }
             ToolOp::TerminalOpen { cols, rows } => {
-                let id = tools.terminal_open(cols, rows)?;
+                let id = tools.terminal_open(*cols, *rows)?;
                 Ok(serde_json::json!({ "ok": true, "term_id": id }))
             }
             ToolOp::TerminalList => {
@@ -143,15 +206,15 @@ pub extern "C" fn rc_tools_call(session_id: u64, json: *const c_char) -> *mut c_
                 cols,
                 rows,
             } => {
-                tools.terminal_attach(term_id, cols, rows)?;
+                tools.terminal_attach(*term_id, *cols, *rows)?;
                 Ok(serde_json::json!({ "ok": true }))
             }
             ToolOp::TerminalDetach { term_id } => {
-                tools.terminal_detach(term_id)?;
+                tools.terminal_detach(*term_id)?;
                 Ok(serde_json::json!({ "ok": true }))
             }
             ToolOp::TerminalInput { term_id, text } => {
-                tools.terminal_input(term_id, text.as_bytes())?;
+                tools.terminal_input(*term_id, text.as_bytes())?;
                 Ok(serde_json::json!({ "ok": true }))
             }
             ToolOp::TerminalResize {
@@ -159,11 +222,11 @@ pub extern "C" fn rc_tools_call(session_id: u64, json: *const c_char) -> *mut c_
                 cols,
                 rows,
             } => {
-                tools.terminal_resize(term_id, cols, rows)?;
+                tools.terminal_resize(*term_id, *cols, *rows)?;
                 Ok(serde_json::json!({ "ok": true }))
             }
             ToolOp::TerminalClose { term_id } => {
-                tools.terminal_close(term_id)?;
+                tools.terminal_close(*term_id)?;
                 Ok(serde_json::json!({ "ok": true }))
             }
             ToolOp::PortmapList => {
@@ -178,27 +241,28 @@ pub extern "C" fn rc_tools_call(session_id: u64, json: *const c_char) -> *mut c_
                 enabled,
             } => {
                 let (rule, _all) = tools.portmap_add_with_enabled(
-                    name,
-                    local_port,
-                    remote_host,
-                    remote_port,
-                    enabled,
+                    name.clone(),
+                    *local_port,
+                    remote_host.clone(),
+                    *remote_port,
+                    *enabled,
                 )?;
                 Ok(serde_json::json!({ "ok": true, "rule_id": rule.id }))
             }
             ToolOp::PortmapRemove { rule_id } => {
-                tools.portmap_delete(rule_id).map(|_| ())?;
+                tools.portmap_delete(*rule_id).map(|_| ())?;
                 Ok(serde_json::json!({ "ok": true }))
             }
             ToolOp::PortmapToggle { rule_id, enabled } => {
-                tools.portmap_toggle(rule_id, enabled).map(|_| ())?;
+                tools.portmap_toggle(*rule_id, *enabled).map(|_| ())?;
                 Ok(serde_json::json!({ "ok": true }))
             }
-        }
+        })();
+        exec.map_err(|msg| classify_tool_error(&op, perms, msg))
     })();
     match result {
         Ok(v) => ok_json(v),
-        Err(e) => err_json(e),
+        Err(e) => e.into_c_string(),
     }
 }
 
@@ -225,7 +289,7 @@ pub extern "C" fn rc_tools_poll(session_id: u64) -> *mut c_char {
             (fe, te, pm)
         })
     else {
-        return err_json("会话不存在");
+        return FfiError::session_not_found().into_c_string();
     };
     let mut out = serde_json::json!({
         "file_events": file_events,
@@ -235,4 +299,41 @@ pub extern "C" fn rc_tools_poll(session_id: u64) -> *mut c_char {
         out["portmap_rules"] = pm;
     }
     ok_json(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_tool_error_maps_forbidden_file_transfer_to_tool_forbidden() {
+        let perms = ToolPermissions {
+            allow_file_transfer: false,
+            allow_terminal: true,
+            allow_port_map: true,
+        };
+        let op = ToolOp::FileUpload {
+            local_path: "/tmp/a.txt".to_string(),
+            remote_dir: "/tmp".to_string(),
+        };
+        let err = classify_tool_error(
+            &op,
+            perms,
+            "目标设备已禁用工具「文件传输」的远程访问权限。".to_string(),
+        );
+        assert_eq!(err.kind, "other");
+        assert_eq!(err.ui_error.code, codes::TOOL_FORBIDDEN);
+        assert!(err.ui_error.message.contains("文件传输"));
+    }
+
+    #[test]
+    fn classify_tool_error_maps_terminal_limit_and_disconnected_session() {
+        let perms = ToolPermissions::all_allowed();
+        let term_op = ToolOp::TerminalOpen { cols: 80, rows: 24 };
+        let limit_err = classify_tool_error(&term_op, perms, "终端会话数已达上限".to_string());
+        assert_eq!(limit_err.ui_error.code, codes::TOOL_TERMINAL_LIMIT_REACHED);
+
+        let disc_err = classify_tool_error(&term_op, perms, "请先建立远控会话".to_string());
+        assert_eq!(disc_err.ui_error.code, codes::SESSION_DISCONNECTED);
+    }
 }

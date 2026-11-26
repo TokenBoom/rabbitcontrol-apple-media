@@ -18,6 +18,10 @@ pub mod auth;
 pub mod runtime;
 pub mod session;
 pub mod tools;
+pub mod ui_error;
+
+pub use session::rc_session_tool_permissions_json;
+pub use ui_error::rc_ui_error_resolve;
 
 /// 返回核心库版本字符串(调用方负责用 `rc_string_free` 释放)。
 #[no_mangle]
@@ -127,8 +131,8 @@ mod tests {
         assert!(!ptr.is_null());
         let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_string();
         unsafe { rc_string_free(ptr) };
+        assert!(!s.is_empty(), "core version must not be empty");
         assert_eq!(s, rc_client_core::version::core_version());
-        assert_eq!(s, "0.1.26");
     }
 
     #[test]
@@ -144,14 +148,13 @@ mod tests {
         let obj = value
             .as_object()
             .expect("rc_core_build_info_json 必须是 JSON 对象");
-        assert_eq!(
-            obj.get("coreVersion").and_then(|v| v.as_str()),
-            Some("0.1.26")
+        let core_ver = obj.get("coreVersion").and_then(|v| v.as_str());
+        assert!(
+            core_ver.is_some_and(|v| !v.is_empty()),
+            "coreVersion must be a non-empty string"
         );
-        assert_eq!(
-            obj.get("coreVersion").and_then(|v| v.as_str()),
-            Some(expected.core_version)
-        );
+        assert_eq!(core_ver, Some(expected.core_version));
+        assert_eq!(core_ver, Some(rc_client_core::version::core_version()));
         assert_eq!(
             obj.get("gitCommit").and_then(|v| v.as_str()),
             Some(expected.git_commit)

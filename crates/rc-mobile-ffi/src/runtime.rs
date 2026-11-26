@@ -14,15 +14,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rc_client_core::auth_client::{
-    parse_rfc3339_unix_sec, AuthHttpClient, AuthSessionManager, BindDeviceRequest,
+    parse_rfc3339_unix_sec, AuthClientError, AuthHttpClient, AuthSessionManager, BindDeviceRequest,
 };
 use rc_client_core::cert_manager::{CertManager, DeviceCertMetadata};
 use rc_client_core::relay_transport::SessionMtlsBundle;
-use rc_client_core::server_config::ServerConfig;
+use rc_client_core::server_config::{ServerConfig, ServerStatusSnapshot};
 use rc_client_core::session_bridge::{SessionHandle, UiSessionConfig};
 use rc_client_core::signal_client::{SignalClientHandle, SignalClientOptions};
+use rc_client_core::ui_error::codes;
 use serde::Deserialize;
 
+use crate::ui_error::{classify_signal_error_for_ios, normalize_ui_error_for_ios, FfiError};
 use crate::{read_c_str, to_c_string};
 
 struct Runtime {
@@ -41,26 +43,54 @@ fn lock_rt() -> std::sync::MutexGuard<'static, Option<Runtime>> {
     runtime().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn err_json(e: impl std::fmt::Display) -> *mut c_char {
-    to_c_string(serde_json::json!({ "error": e.to_string(), "kind": "other" }).to_string())
-}
-
-fn parse<'a, T: Deserialize<'a>>(ptr: *const c_char) -> Result<T, String> {
+fn parse<'a, T: Deserialize<'a>>(ptr: *const c_char) -> Result<T, FfiError> {
     let Some(s) = read_c_str(ptr) else {
-        return Err("缺少 JSON 参数".to_string());
+        return Err(FfiError::invalid_json("缺少 JSON 参数"));
     };
-    serde_json::from_str(s).map_err(|e| format!("JSON 参数解析失败: {e}"))
+    serde_json::from_str(s).map_err(|e| FfiError::invalid_json(format!("JSON 参数解析失败: {e}")))
 }
 
-fn with_runtime(f: impl FnOnce(&Runtime) -> Result<serde_json::Value, String>) -> *mut c_char {
+fn with_runtime(f: impl FnOnce(&Runtime) -> Result<serde_json::Value, FfiError>) -> *mut c_char {
     let guard = lock_rt();
     let Some(rt) = guard.as_ref() else {
-        return err_json("运行时尚未初始化,请先调用 rc_runtime_init");
+        return FfiError::runtime_not_initialized("运行时尚未初始化,请先调用 rc_runtime_init")
+            .into_c_string();
     };
     match f(rt) {
         Ok(v) => to_c_string(v.to_string()),
-        Err(e) => err_json(e),
+        Err(e) => e.into_c_string(),
     }
+}
+
+pub(crate) fn normalize_server_status_for_ios(
+    mut snap: ServerStatusSnapshot,
+) -> ServerStatusSnapshot {
+    let non_empty_err = snap
+        .error_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    snap.ui_error = match snap.ui_error {
+        Some(ui) => {
+            let normalized = normalize_ui_error_for_ios(ui);
+            if normalized.code == codes::NETWORK_UNREACHABLE {
+                if let Some(msg) = non_empty_err {
+                    let refined = classify_signal_error_for_ios(msg);
+                    if refined.code != codes::NETWORK_UNREACHABLE {
+                        Some(refined)
+                    } else {
+                        Some(normalized)
+                    }
+                } else {
+                    Some(normalized)
+                }
+            } else {
+                Some(normalized)
+            }
+        }
+        None => non_empty_err.map(classify_signal_error_for_ios),
+    };
+    snap
 }
 
 // ── 初始化 ──
@@ -108,7 +138,7 @@ fn now_sec() -> u64 {
         .as_secs()
 }
 
-fn access_token(auth: &AuthSessionManager, external: bool) -> Result<String, String> {
+fn access_token_for_signal(auth: &AuthSessionManager, external: bool) -> Result<String, String> {
     if external {
         auth.current_session()
             .filter(|s| s.access_expires_at_unix_sec > now_sec())
@@ -119,6 +149,24 @@ fn access_token(auth: &AuthSessionManager, external: bool) -> Result<String, Str
     }
 }
 
+fn access_token_ffi(auth: &AuthSessionManager, external: bool) -> Result<String, FfiError> {
+    if external {
+        auth.current_session()
+            .filter(|s| s.access_expires_at_unix_sec > now_sec())
+            .map(|s| s.access_token)
+            .ok_or_else(|| {
+                FfiError::resolved_with_kind(
+                    codes::AUTH_RELOGIN_REQUIRED,
+                    "unauthorized",
+                    "请刷新钥匙串登录态",
+                )
+            })
+    } else {
+        auth.ensure_valid_access_token()
+            .map_err(|e| FfiError::from_auth(&e))
+    }
+}
+
 // The core certificate helper can rotate refresh tokens on a 401. On iOS
 // Keychain owns rotation, so request the certificate with the supplied access token only.
 fn ensure_external_cert(
@@ -126,32 +174,44 @@ fn ensure_external_cert(
     client: &AuthHttpClient,
     token: &str,
     id: &str,
-) -> Result<bool, String> {
-    let user = rt.auth.current_session().ok_or("未登录")?.user_id;
+) -> Result<bool, FfiError> {
+    let user = rt
+        .auth
+        .current_session()
+        .ok_or_else(|| {
+            FfiError::resolved_with_kind(codes::AUTH_UNAUTHORIZED, "unauthorized", "未登录")
+        })?
+        .user_id;
     if rt.cert_manager.needs_renewal_for(now_sec(), &user, id) {
         let csr = rt
             .cert_manager
-            .generate_csr_pem(Some(&format!("rc-device-{id}")))?;
+            .generate_csr_pem(Some(&format!("rc-device-{id}")))
+            .map_err(|e| FfiError::resolved(codes::PKI_INVALID_CSR, e))?;
         let cert = client
             .issue_device_cert(token, id, &csr)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| FfiError::from_auth(&e))?;
         let expiry = cert
             .expires_at_unix_sec
             .or_else(|| parse_rfc3339_unix_sec(&cert.expires_at));
         if cert.device_id != id || cert.user_id != user || !expiry.is_some_and(|t| t > now_sec()) {
-            return Err("设备证书身份或有效期不符".into());
+            return Err(FfiError::resolved(
+                codes::PKI_ERROR,
+                "设备证书身份或有效期不符",
+            ));
         }
-        rt.cert_manager.save_device_cert(
-            &cert.cert_pem,
-            &DeviceCertMetadata {
-                serial_hex: cert.serial_hex,
-                device_id: cert.device_id,
-                user_id: cert.user_id,
-                expires_at_unix_sec: expiry.unwrap(),
-                issued_at_unix_sec: parse_rfc3339_unix_sec(&cert.issued_at).unwrap_or_default(),
-                fingerprint_sha256: cert.fingerprint_sha256,
-            },
-        )?;
+        rt.cert_manager
+            .save_device_cert(
+                &cert.cert_pem,
+                &DeviceCertMetadata {
+                    serial_hex: cert.serial_hex,
+                    device_id: cert.device_id,
+                    user_id: cert.user_id,
+                    expires_at_unix_sec: expiry.unwrap(),
+                    issued_at_unix_sec: parse_rfc3339_unix_sec(&cert.issued_at).unwrap_or_default(),
+                    fingerprint_sha256: cert.fingerprint_sha256,
+                },
+            )
+            .map_err(|e| FfiError::resolved(codes::PKI_ERROR, e))?;
     }
     Ok(true)
 }
@@ -159,14 +219,15 @@ fn ensure_external_cert(
 /// 初始化运行时(幂等:重复调用重建)。返回 `{"device_pubkey_hex": ...}`。
 #[no_mangle]
 pub extern "C" fn rc_runtime_init(json: *const c_char) -> *mut c_char {
-    let result: Result<serde_json::Value, String> = (|| {
+    let result: Result<serde_json::Value, FfiError> = (|| {
         let req: InitRequest = parse(json)?;
         let data_dir = PathBuf::from(&req.data_dir);
         let certs_dir = data_dir.join("certs");
         let auth_path = data_dir.join("auth_session.json");
-        let cert_manager = Arc::new(
-            CertManager::load_or_init(certs_dir).map_err(|e| format!("证书管理器初始化: {e}"))?,
-        );
+        let cert_manager =
+            Arc::new(CertManager::load_or_init(certs_dir).map_err(|e| {
+                FfiError::resolved(codes::PKI_ERROR, format!("证书管理器初始化: {e}"))
+            })?);
         let mut cfg = ServerConfig {
             enabled: true,
             server_host: req.server_host,
@@ -181,7 +242,8 @@ pub extern "C" fn rc_runtime_init(json: *const c_char) -> *mut c_char {
         };
         if req.external_auth {
             cfg.device_key = cert_manager.device_pubkey_hex();
-            rc_client_core::auth_client::delete_auth_session(&auth_path)?;
+            rc_client_core::auth_client::delete_auth_session(&auth_path)
+                .map_err(FfiError::invalid_config)?;
         }
         let auth = AuthSessionManager::new(cfg, auth_path, Arc::clone(&cert_manager));
         if !req.external_auth {
@@ -198,7 +260,7 @@ pub extern "C" fn rc_runtime_init(json: *const c_char) -> *mut c_char {
     })();
     match result {
         Ok(v) => to_c_string(v.to_string()),
-        Err(e) => err_json(e),
+        Err(e) => e.into_c_string(),
     }
 }
 
@@ -232,11 +294,11 @@ fn session_json(rt: &Runtime) -> serde_json::Value {
 pub extern "C" fn rc_runtime_login(json: *const c_char) -> *mut c_char {
     let req: LoginReq = match parse(json) {
         Ok(r) => r,
-        Err(e) => return err_json(e),
+        Err(e) => return e.into_c_string(),
     };
     with_runtime(|rt| {
         if rt.external_auth {
-            return Err("此客户端由系统钥匙串提供登录态".into());
+            return Err(FfiError::invalid_config("此客户端由系统钥匙串提供登录态"));
         }
         rt.auth
             .login(
@@ -245,7 +307,7 @@ pub extern "C" fn rc_runtime_login(json: *const c_char) -> *mut c_char {
                 req.hostname.as_deref(),
                 req.os.as_deref(),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e: AuthClientError| FfiError::from_auth(&e))?;
         Ok(session_json(rt))
     })
 }
@@ -255,7 +317,7 @@ pub extern "C" fn rc_runtime_login(json: *const c_char) -> *mut c_char {
 pub extern "C" fn rc_runtime_set_session(json: *const c_char) -> *mut c_char {
     let session: rc_client_core::auth_client::StoredAuthSession = match parse(json) {
         Ok(session) => session,
-        Err(error) => return err_json(error),
+        Err(error) => return error.into_c_string(),
     };
     with_runtime(move |rt| {
         let cfg = rt.auth.server_config();
@@ -266,7 +328,7 @@ pub extern "C" fn rc_runtime_set_session(json: *const c_char) -> *mut c_char {
             || session.server_host != cfg.server_host
             || session.api_port != cfg.api_port
         {
-            return Err("登录态与当前运行时不匹配".into());
+            return Err(FfiError::invalid_config("登录态与当前运行时不匹配"));
         }
         rt.auth.apply_external_session(session);
         Ok(serde_json::json!({"ok": true}))
@@ -286,7 +348,7 @@ pub extern "C" fn rc_runtime_logout() -> *mut c_char {
         if rt.external_auth {
             rt.auth.wipe_local_credentials();
         } else {
-            rt.auth.logout(None).map_err(|e| e.to_string())?;
+            rt.auth.logout(None).map_err(|e| FfiError::from_auth(&e))?;
         }
         Ok(serde_json::json!({ "ok": true }))
     })
@@ -313,10 +375,10 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
         lan_addrs: None,
     });
     with_runtime(|rt| {
-        let token = access_token(&rt.auth, rt.external_auth)?;
+        let token = access_token_ffi(&rt.auth, rt.external_auth)?;
         let cfg = rt.auth.server_config();
         let client = rc_client_core::auth_client::AuthHttpClient::from_server_config(&cfg)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| FfiError::from_auth(&e))?;
         // 绑定(幂等):同 device_key 重绑返回同一设备
         let bound = client
             .bind_device(
@@ -332,13 +394,13 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
                     arch: Some(rc_client_core::platform::current_app_arch().to_string()),
                 },
             )
-            .map_err(|e| format!("设备绑定: {e}"))?;
+            .map_err(|e| FfiError::from_auth_with_message(format!("设备绑定: {e}"), &e))?;
         let cert_ready = if rt.external_auth {
             ensure_external_cert(rt, &client, &token, &bound.device_id)?
         } else {
             rt.auth
                 .ensure_device_cert(&bound.device_id)
-                .map_err(|e| format!("设备证书: {e}"))?
+                .map_err(|e| FfiError::from_auth_with_message(format!("设备证书: {e}"), &e))?
         };
         // 拉起信令(已运行则先停)
         {
@@ -351,12 +413,12 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
             let auth_for_token = Arc::clone(&rt.auth);
             let external = rt.external_auth;
             let token_provider: rc_client_core::signal_client::TokenProvider =
-                Arc::new(move || access_token(&auth_for_token, external));
+                Arc::new(move || access_token_for_signal(&auth_for_token, external));
             let auth_for_refresh = Arc::clone(&rt.auth);
             let token_refresher: rc_client_core::signal_client::TokenRefresher =
                 Arc::new(move |stale| {
                     if external {
-                        access_token(&auth_for_refresh, true)
+                        access_token_for_signal(&auth_for_refresh, true)
                     } else {
                         auth_for_refresh
                             .refresh_after_unauthorized(stale)
@@ -439,47 +501,53 @@ fn default_timeout() -> u64 {
     15
 }
 
-/// 一键连接设备:信令 request_connect → 组装路由/mTLS/免密票据 → 开会话。
-/// 阻塞至拿到连接授权(默认 15s 超时)。返回 `{"session_id": N, "owner_connection": bool}`。
+/// 查询当前信令状态快照（含 `uiError` 结构化模型）。
 #[no_mangle]
 pub extern "C" fn rc_signal_status(_json: *const c_char) -> *mut c_char {
     let guard = lock_rt();
     let Some(rt) = guard.as_ref() else {
-        return err_json("运行时未初始化");
+        return FfiError::runtime_not_initialized("运行时未初始化").into_c_string();
     };
     let slot = rt.signal.lock().unwrap_or_else(|e| e.into_inner());
     match slot.as_ref() {
         Some(handle) => {
-            let snap = handle.status();
+            let snap = normalize_server_status_for_ios(handle.status());
             to_c_string(serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()))
         }
-        None => err_json("信令未启动"),
+        None => FfiError::signal_not_started("信令未启动").into_c_string(),
     }
 }
 
+/// 一键连接设备:信令 request_connect → 组装路由/mTLS/免密票据 → 开会话。
+/// 阻塞至拿到连接授权(默认 15s 超时)。返回 `{"session_id": N, "owner_connection": bool}`。
 #[no_mangle]
 pub extern "C" fn rc_runtime_connect(json: *const c_char) -> *mut c_char {
     let req: ConnectReq = match parse(json) {
         Ok(r) => r,
-        Err(e) => return err_json(e),
+        Err(e) => return e.into_c_string(),
     };
-    let result: Result<(u64, bool), String> = (|| {
+    let result: Result<(u64, bool), FfiError> = (|| {
         let guard = lock_rt();
-        let rt = guard.as_ref().ok_or("运行时未初始化")?;
+        let rt = guard
+            .as_ref()
+            .ok_or_else(|| FfiError::runtime_not_initialized("运行时未初始化"))?;
         let signal = {
             let slot = rt.signal.lock().unwrap_or_else(|e| e.into_inner());
             slot.as_ref()
                 .map(Arc::clone)
-                .ok_or("信令未启动,请先 rc_signal_start")?
+                .ok_or_else(|| FfiError::signal_not_started("信令未启动,请先 rc_signal_start"))?
         };
         let grant = signal
             .request_connect(&req.target_id, Duration::from_secs(req.timeout_sec))
-            .map_err(|e| format!("连接请求: {e}"))?;
+            .map_err(|e| FfiError::from_signal_error(format!("连接请求: {e}"), &e))?;
 
         // mTLS 证书束(加密连接;无本地证书时降级为不加密)
         let mtls = build_mtls_bundle(rt, &grant.target_id);
         if rt.external_auth && mtls.is_none() {
-            return Err("缺少可信设备证书，已停止连接。请测试服务器连接后重新登录。".into());
+            return Err(FfiError::resolved(
+                codes::PKI_CERT_MISSING,
+                "缺少可信设备证书，已停止连接。请测试服务器连接后重新登录。",
+            ));
         }
         let encrypt = mtls.is_some();
 
@@ -518,7 +586,7 @@ pub extern "C" fn rc_runtime_connect(json: *const c_char) -> *mut c_char {
         Ok((id, owner)) => to_c_string(
             serde_json::json!({ "session_id": id, "owner_connection": owner }).to_string(),
         ),
-        Err(e) => err_json(e),
+        Err(e) => e.into_c_string(),
     }
 }
 
