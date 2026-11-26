@@ -135,6 +135,16 @@ char *rc_apple_media_frame_take(void);
 /// 释放帧(仅限 rc_apple_media_frame_take / rc_apple_media_frame_take_raw 取走的 ptr,每帧一次)。
 void rc_apple_media_frame_release(uint64_t ptr);
 
+// ── 出站网络代理（进程级全局配置，可在 rc_runtime_init 前调用）──
+
+/// 更新进程级活跃出站代理配置（ProxyConfig JSON，camelCase 字段：
+/// mode("none"|"system"|"manual") / protocol?("http"|"socks5") / host / port / username? / password?）。
+/// 校验合法后立即对后续认证、信令与中继生效；若配置发生变更且信令已启动，
+/// 将自动触发信令快速重连切换至新代理路径。成功返回 {"ok":true}，
+/// 失败返回统一错误信封（含 iOS `ui_error`，绝不泄露密码明文）。
+/// 返回值由 Rust 侧分配，用后必须 `rc_string_free` 释放。
+char *rc_proxy_set_config_json(const char *config_json);
+
 // ── 运行时(有状态:认证会话+信令+一键连接;所有返回字符串均须 `rc_string_free` 释放)──
 // 失败时一律返回统一错误信封:{"error": "...", "kind": "...", "ui_error": { ...RCUiError... }}（snake_case `ui_error`）。
 char *rc_runtime_init(const char *json);
@@ -149,6 +159,18 @@ char *rc_signal_start(const char *json);
 /// 返回值由 Rust 侧分配，用后必须 `rc_string_free` 释放。
 char *rc_signal_status(const char *json);
 char *rc_signal_stop(void);
+/// 向服务端发起 Wake-on-LAN 远程开机请求（阻塞等待 `wol_ack`，禁止主线程调用）。
+/// - `target_device_id`: 目标 9 位设备码（允许带空格格式化）。
+/// - `timeout_ms`: 等待超时毫秒数（传 0 默认 10000ms，上限 60000ms）。
+/// 成功收到服务端应答时返回 `WolAckResult` JSON（camelCase 字段：
+/// targetDeviceId / ok / method / code? / message / uiError?）；
+/// 入参非法、运行时未初始化、信令未启动、超时或断线时返回统一错误信封（snake_case `ui_error`）。
+/// 返回值由 Rust 侧分配，用后必须 `rc_string_free` 释放。
+char *rc_signal_request_wol(const char *target_device_id, uint32_t timeout_ms);
+/// 返回当前已缓存的同账号设备 Wake-on-LAN 能力快照 JSON 对象（键为 9 位规范设备码，值为 bool）。
+/// 运行时未初始化或信令未启动时返回 "{}"。
+/// 返回值由 Rust 侧分配，用后必须 `rc_string_free` 释放。
+char *rc_signal_wol_capable_snapshot_json(void);
 char *rc_runtime_connect(const char *json);
 
 // ── 工具通道(文件/终端/端口映射;所有返回字符串均须 `rc_string_free` 释放)──

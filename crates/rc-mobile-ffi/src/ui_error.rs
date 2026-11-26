@@ -286,7 +286,10 @@ mod tests {
     use crate::auth::{rc_auth_login, rc_auth_logout, rc_auth_refresh, rc_server_probe};
     use crate::rc_string_free;
     use crate::runtime::{
-        normalize_server_status_for_ios, rc_runtime_connect, rc_runtime_init, rc_signal_status,
+        effective_wol_timeout_ms, install_test_signal_for_unit_test,
+        normalize_server_status_for_ios, normalize_wol_ack_for_ios, rc_proxy_set_config_json,
+        rc_runtime_connect, rc_runtime_init, rc_signal_request_wol, rc_signal_status,
+        rc_signal_stop, rc_signal_wol_capable_snapshot_json,
     };
     use crate::session::{
         normalize_session_update_for_ios, rc_session_close, rc_session_command, rc_session_input,
@@ -865,5 +868,364 @@ mod tests {
         let ended_ios_ui = assert_rc_ui_error_schema(&ended_ios_json["data"]["ui_error"]);
         assert_eq!(ended_ios_ui.code, codes::AUTH_TOKEN_REUSE_DETECTED);
         assert!(ended_ios_ui.suggestion.contains("钥匙串"));
+    }
+
+    fn take_raw(ptr: *mut c_char) -> String {
+        assert!(!ptr.is_null(), "FFI returned null pointer");
+        let raw = unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .expect("FFI returned invalid UTF-8")
+            .to_string();
+        unsafe { rc_string_free(ptr) };
+        raw
+    }
+
+    #[test]
+    fn rc_proxy_set_config_json_valid_invalid_null_and_password_redaction() {
+        use rc_client_core::proxy::{active_proxy_config, ProxyMode, ProxyProtocol};
+
+        // 1) Null & non-UTF-8 inputs -> validation.invalid_json
+        let v_null = take_json(rc_proxy_set_config_json(std::ptr::null()));
+        let (_, kind, ui) = assert_error_envelope(&v_null);
+        assert_eq!(kind, "other");
+        assert_eq!(ui.code, codes::VALIDATION_INVALID_JSON);
+
+        let bad_utf8: &[u8] = b"\xff\xfe\0";
+        let v_bad_utf8 = take_json(rc_proxy_set_config_json(bad_utf8.as_ptr().cast::<c_char>()));
+        let (_, _, ui) = assert_error_envelope(&v_bad_utf8);
+        assert_eq!(ui.code, codes::VALIDATION_INVALID_JSON);
+
+        // 2) Valid manual SOCKS5 proxy with credentials -> {"ok": true}, no password echoed
+        let secret_ok = "Socks5Secret!#9182";
+        let valid_socks = CString::new(format!(
+            r#"{{"mode":"manual","protocol":"socks5","host":"proxy.corp.local","port":1080,"username":"alice","password":"{secret_ok}"}}"#
+        ))
+        .unwrap();
+        let raw_ok = take_raw(rc_proxy_set_config_json(valid_socks.as_ptr()));
+        assert!(
+            !raw_ok.contains(secret_ok),
+            "success response leaked password"
+        );
+        let v_ok: serde_json::Value = serde_json::from_str(&raw_ok).unwrap();
+        assert_eq!(v_ok["ok"], serde_json::json!(true));
+
+        let active = active_proxy_config();
+        assert_eq!(active.mode, ProxyMode::Manual);
+        assert_eq!(active.protocol, Some(ProxyProtocol::Socks5));
+        assert_eq!(active.host, "proxy.corp.local");
+        assert_eq!(active.port, 1080);
+        assert_eq!(active.username.as_deref(), Some("alice"));
+        assert_eq!(active.password.as_deref(), Some(secret_ok));
+
+        // 3) Malformed JSON containing secrets -> validation.invalid_json, zero secret leakage
+        let secret_malformed = "MalformedJsonSecret!#7744";
+        for bad_payload in [
+            format!(
+                r#"{{"mode":"manual","protocol":"socks5","host":"proxy.corp","port":"{secret_malformed}","password":"{secret_malformed}"}}"#
+            ),
+            format!(r#"{{"mode":"manual","password":"{secret_malformed}""#),
+        ] {
+            let c = CString::new(bad_payload).unwrap();
+            let raw = take_raw(rc_proxy_set_config_json(c.as_ptr()));
+            assert!(
+                !raw.contains(secret_malformed),
+                "malformed JSON error leaked secret: {raw}"
+            );
+            let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let (_, kind, ui) = assert_error_envelope(&val);
+            assert_eq!(kind, "other");
+            assert_eq!(ui.code, codes::VALIDATION_INVALID_JSON);
+        }
+
+        // 4) Invalid manual proxy configs -> proxy.config_conflict, zero password leakage,
+        //    and previously active global proxy config must remain untouched
+        let secret_invalid = "InvalidConfigSecret!#5522";
+        let long_secret = format!("{secret_invalid}{}", "x".repeat(260));
+        let invalid_cases = [
+            // missing protocol
+            format!(
+                r#"{{"mode":"manual","host":"proxy.corp","port":1080,"username":"u","password":"{secret_invalid}"}}"#
+            ),
+            // port == 0
+            format!(
+                r#"{{"mode":"manual","protocol":"http","host":"proxy.corp","port":0,"username":"u","password":"{secret_invalid}"}}"#
+            ),
+            // empty host
+            format!(
+                r#"{{"mode":"manual","protocol":"http","host":"  ","port":8080,"username":"u","password":"{secret_invalid}"}}"#
+            ),
+            // CRLF in password
+            format!(
+                r#"{{"mode":"manual","protocol":"http","host":"proxy.corp","port":8080,"username":"u","password":"{secret_invalid}\r\nX-Injected: 1"}}"#
+            ),
+            // HTTP Basic username with ':'
+            format!(
+                r#"{{"mode":"manual","protocol":"http","host":"proxy.corp","port":8080,"username":"bad:user","password":"{secret_invalid}"}}"#
+            ),
+            // SOCKS5 password > 255 bytes
+            format!(
+                r#"{{"mode":"manual","protocol":"socks5","host":"proxy.corp","port":1080,"username":"u","password":"{long_secret}"}}"#
+            ),
+        ];
+        for case in invalid_cases {
+            let c = CString::new(case).unwrap();
+            let raw = take_raw(rc_proxy_set_config_json(c.as_ptr()));
+            assert!(
+                !raw.contains(secret_invalid),
+                "proxy validation error leaked secret: {raw}"
+            );
+            let val: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let (_, kind, ui) = assert_error_envelope(&val);
+            assert_eq!(kind, "other");
+            assert_eq!(ui.code, codes::PROXY_CONFIG_CONFLICT);
+        }
+        // Global config unchanged after invalid attempts
+        assert_eq!(active_proxy_config().host, "proxy.corp.local");
+
+        // 5) Reset to mode="none" so global state stays clean for other tests
+        let none_cfg = CString::new(r#"{"mode":"none"}"#).unwrap();
+        let v_none = take_json(rc_proxy_set_config_json(none_cfg.as_ptr()));
+        assert_eq!(v_none["ok"], serde_json::json!(true));
+        assert_eq!(active_proxy_config().mode, ProxyMode::None);
+    }
+
+    #[test]
+    fn rc_signal_wol_ffi_and_capable_snapshot_behave_safely() {
+        use rc_client_core::signal_client::WolAckResult;
+
+        // 1) Null / non-UTF-8 / blank target_device_id -> validation.invalid_input
+        let v_null = take_json(rc_signal_request_wol(std::ptr::null(), 5_000));
+        let (_, kind, ui) = assert_error_envelope(&v_null);
+        assert_eq!(kind, "other");
+        assert_eq!(ui.code, codes::VALIDATION_INVALID_INPUT);
+
+        let bad_utf8: &[u8] = b"\xff\xfe\0";
+        let v_bad_utf8 = take_json(rc_signal_request_wol(bad_utf8.as_ptr().cast::<c_char>(), 0));
+        let (_, _, ui) = assert_error_envelope(&v_bad_utf8);
+        assert_eq!(ui.code, codes::VALIDATION_INVALID_INPUT);
+
+        let blank = CString::new("   \t ").unwrap();
+        let v_blank = take_json(rc_signal_request_wol(blank.as_ptr(), 0));
+        let (_, _, ui) = assert_error_envelope(&v_blank);
+        assert_eq!(ui.code, codes::VALIDATION_INVALID_INPUT);
+
+        // 2) Before signal start: snapshot returns {} and request_wol returns
+        //    service.runtime_not_initialized or signal.not_started
+        let snap_before = take_json(rc_signal_wol_capable_snapshot_json());
+        assert_eq!(snap_before, serde_json::json!({}));
+
+        let target = CString::new("200 000 002").unwrap();
+        let v_unstarted = take_json(rc_signal_request_wol(target.as_ptr(), 0));
+        let (_, kind, ui) = assert_error_envelope(&v_unstarted);
+        assert_eq!(kind, "other");
+        assert!(
+            ui.code == codes::SERVICE_RUNTIME_NOT_INITIALIZED
+                || ui.code == codes::SIGNAL_NOT_STARTED,
+            "unexpected code before signal start: {}",
+            ui.code
+        );
+
+        // 3) After rc_runtime_init without rc_signal_start -> strictly signal.not_started,
+        //    and snapshot remains empty object {}
+        let tmp_dir =
+            std::env::temp_dir().join(format!("rc-mobile-ffi-wol-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let init_payload = serde_json::json!({
+            "external_auth": true,
+            "server_host": "127.0.0.1",
+            "data_dir": tmp_dir.to_string_lossy(),
+        });
+        let init_c = CString::new(init_payload.to_string()).unwrap();
+        let init_res = take_json(rc_runtime_init(init_c.as_ptr()));
+        assert!(
+            init_res
+                .get("device_pubkey_hex")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "rc_runtime_init failed: {init_res}"
+        );
+
+        let v_not_started = take_json(rc_signal_request_wol(target.as_ptr(), 3_000));
+        let (_, kind, ui) = assert_error_envelope(&v_not_started);
+        assert_eq!(kind, "other");
+        assert_eq!(ui.code, codes::SIGNAL_NOT_STARTED);
+
+        let snap_after_init = take_json(rc_signal_wol_capable_snapshot_json());
+        assert_eq!(snap_after_init, serde_json::json!({}));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 4) WolAckResult iOS normalization & camelCase JSON schema
+        let ok_ack = normalize_wol_ack_for_ios(WolAckResult {
+            target_device_id: "200000002".to_string(),
+            ok: true,
+            method: "lan_peer".to_string(),
+            code: None,
+            message: "已发送局域网唤醒包".to_string(),
+            ui_error: None,
+        });
+        let ok_json = serde_json::to_value(&ok_ack).unwrap();
+        assert_eq!(ok_json["targetDeviceId"], "200000002");
+        assert_eq!(ok_json["ok"], true);
+        assert_eq!(ok_json["method"], "lan_peer");
+        assert!(ok_json.get("uiError").is_none());
+
+        let fail_ack = normalize_wol_ack_for_ios(WolAckResult {
+            target_device_id: "200000002".to_string(),
+            ok: false,
+            method: "none".to_string(),
+            code: Some("wol_no_relay_peer".to_string()),
+            message: "无可用同局域网在线设备".to_string(),
+            ui_error: Some(resolve_ui_error(
+                codes::WOL_NO_RELAY_PEER,
+                ErrorPlatform::Macos,
+                &[],
+                None,
+                Some("no relay peer".to_string()),
+            )),
+        });
+        let fail_json = serde_json::to_value(&fail_ack).unwrap();
+        assert_eq!(fail_json["ok"], false);
+        assert_eq!(fail_json["code"], "wol_no_relay_peer");
+        let wol_ui = assert_rc_ui_error_schema(&fail_json["uiError"]);
+        assert_eq!(wol_ui.code, codes::WOL_NO_RELAY_PEER);
+
+        // 5) timeout_ms clamping boundaries (0 -> 10_000ms, >60_000ms -> 60_000ms)
+        assert_eq!(effective_wol_timeout_ms(0), 10_000);
+        assert_eq!(effective_wol_timeout_ms(1), 1);
+        assert_eq!(effective_wol_timeout_ms(5_000), 5_000);
+        assert_eq!(effective_wol_timeout_ms(60_000), 60_000);
+        assert_eq!(effective_wol_timeout_ms(60_001), 60_000);
+        assert_eq!(effective_wol_timeout_ms(u32::MAX), 60_000);
+    }
+
+    #[test]
+    fn proxy_change_triggers_signal_reconnect_and_signal_stop_stops_held_arc() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use rc_client_core::server_config::ServerConfig;
+        use rc_client_core::signal_client::{SignalClientHandle, SignalClientOptions};
+
+        // Ensure clean initial proxy state
+        let none_cfg = CString::new(r#"{"mode":"none"}"#).unwrap();
+        let _ = take_json(rc_proxy_set_config_json(none_cfg.as_ptr()));
+
+        // Local loopback listener: accepts TCP and immediately closes so SignalClientHandle
+        // enters backoff sleep after attempt #1 (100% offline, loopback always bypasses proxy).
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        let port = listener.local_addr().unwrap().port();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let stop_listener = Arc::new(AtomicBool::new(false));
+        let accept_count_bg = Arc::clone(&accept_count);
+        let stop_bg = Arc::clone(&stop_listener);
+        let listener_thread = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        accept_count_bg.fetch_add(1, Ordering::AcqRel);
+                        drop(stream);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rc-mobile-ffi-proxy-reconnect-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let init_payload = serde_json::json!({
+            "external_auth": true,
+            "server_host": "127.0.0.1",
+            "signal_port": port,
+            "data_dir": tmp_dir.to_string_lossy(),
+        });
+        let init_c = CString::new(init_payload.to_string()).unwrap();
+        let init_res = take_json(rc_runtime_init(init_c.as_ptr()));
+        assert!(init_res.get("device_pubkey_hex").is_some());
+
+        let sig_cfg = ServerConfig {
+            enabled: true,
+            server_host: "127.0.0.1".to_string(),
+            signal_port: port,
+            ..ServerConfig::default()
+        };
+        let handle = SignalClientHandle::spawn_with_options(
+            sig_cfg,
+            "ios-unit-test".to_string(),
+            Vec::new(),
+            SignalClientOptions {
+                dynamic_lan_discovery: false,
+                upnp_enabled: false,
+                ..SignalClientOptions::default()
+            },
+            |_| {},
+        );
+        // Hold an external Arc clone (simulating an in-flight rc_signal_request_wol caller)
+        let held_arc = install_test_signal_for_unit_test(handle);
+
+        // Wait for initial connection attempt
+        let wait_first = Instant::now() + Duration::from_secs(3);
+        while accept_count.load(Ordering::Acquire) < 1 && Instant::now() < wait_first {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(
+            accept_count.load(Ordering::Acquire) >= 1,
+            "expected initial signal connect attempt"
+        );
+
+        // Calling rc_proxy_set_config_json with unchanged config succeeds cleanly
+        let unchanged = take_json(rc_proxy_set_config_json(none_cfg.as_ptr()));
+        assert_eq!(unchanged["ok"], serde_json::json!(true));
+
+        // Changing proxy config triggers fast reconnect on active SignalClientHandle
+        let count_before_change = accept_count.load(Ordering::Acquire);
+        let manual_cfg =
+            CString::new(r#"{"mode":"manual","protocol":"socks5","host":"192.0.2.1","port":1080}"#)
+                .unwrap();
+        let changed_res = take_json(rc_proxy_set_config_json(manual_cfg.as_ptr()));
+        assert_eq!(changed_res["ok"], serde_json::json!(true));
+
+        let wait_reconnect = Instant::now() + Duration::from_secs(3);
+        while accept_count.load(Ordering::Acquire) <= count_before_change
+            && Instant::now() < wait_reconnect
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            accept_count.load(Ordering::Acquire) > count_before_change,
+            "proxy change must trigger signal fast reconnect"
+        );
+
+        // rc_signal_stop must explicitly call old.request_stop() even while held_arc keeps refcount > 1
+        let stop_res = take_json(rc_signal_stop());
+        assert_eq!(stop_res["ok"], serde_json::json!(true));
+
+        let t0 = Instant::now();
+        let wol_err = held_arc
+            .request_wol("200000002", Duration::from_secs(5))
+            .expect_err("stopped SignalClientHandle must immediately reject request_wol");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "request_wol after rc_signal_stop must not hang: {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(wol_err.code, codes::SESSION_CANCELLED);
+
+        drop(held_arc);
+        let _ = take_json(rc_proxy_set_config_json(none_cfg.as_ptr()));
+        stop_listener.store(true, Ordering::Release);
+        let _ = listener_thread.join();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

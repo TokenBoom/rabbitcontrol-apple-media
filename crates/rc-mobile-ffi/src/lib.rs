@@ -20,6 +20,9 @@ pub mod session;
 pub mod tools;
 pub mod ui_error;
 
+pub use runtime::{
+    rc_proxy_set_config_json, rc_signal_request_wol, rc_signal_wol_capable_snapshot_json,
+};
 pub use session::rc_session_tool_permissions_json;
 pub use ui_error::rc_ui_error_resolve;
 

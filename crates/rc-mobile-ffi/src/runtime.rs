@@ -8,6 +8,7 @@
 //!
 //! 全部函数阻塞式,移动端必须在后台线程调用。
 
+use std::collections::BTreeMap;
 use std::os::raw::c_char;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -17,14 +18,17 @@ use rc_client_core::auth_client::{
     parse_rfc3339_unix_sec, AuthClientError, AuthHttpClient, AuthSessionManager, BindDeviceRequest,
 };
 use rc_client_core::cert_manager::{CertManager, DeviceCertMetadata};
+use rc_client_core::proxy::{active_proxy_config, set_global_proxy_config, ProxyConfig};
 use rc_client_core::relay_transport::SessionMtlsBundle;
 use rc_client_core::server_config::{ServerConfig, ServerStatusSnapshot};
 use rc_client_core::session_bridge::{SessionHandle, UiSessionConfig};
-use rc_client_core::signal_client::{SignalClientHandle, SignalClientOptions};
-use rc_client_core::ui_error::codes;
+use rc_client_core::signal_client::{SignalClientHandle, SignalClientOptions, WolAckResult};
+use rc_client_core::ui_error::{codes, IntoUiError, UiError};
 use serde::Deserialize;
 
-use crate::ui_error::{classify_signal_error_for_ios, normalize_ui_error_for_ios, FfiError};
+use crate::ui_error::{
+    classify_signal_error_for_ios, normalize_ui_error_for_ios, FfiError, MOBILE_ERROR_PLATFORM,
+};
 use crate::{read_c_str, to_c_string};
 
 struct Runtime {
@@ -250,12 +254,26 @@ pub extern "C" fn rc_runtime_init(json: *const c_char) -> *mut c_char {
             let _ = auth.restore_on_startup();
         }
         let pubkey = cert_manager.device_pubkey_hex();
-        *lock_rt() = Some(Runtime {
-            auth: Arc::new(auth),
-            external_auth: req.external_auth,
-            cert_manager,
-            signal: Mutex::new(None),
-        });
+        let old_signal = {
+            let mut guard = lock_rt();
+            let prev_rt = guard.replace(Runtime {
+                auth: Arc::new(auth),
+                external_auth: req.external_auth,
+                cert_manager,
+                signal: Mutex::new(None),
+            });
+            prev_rt.and_then(|old_rt| {
+                old_rt
+                    .signal
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+            })
+        };
+        if let Some(old) = old_signal {
+            old.request_stop();
+            drop(old);
+        }
         Ok(serde_json::json!({ "device_pubkey_hex": pubkey }))
     })();
     match result {
@@ -402,10 +420,16 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
                 .ensure_device_cert(&bound.device_id)
                 .map_err(|e| FfiError::from_auth_with_message(format!("设备证书: {e}"), &e))?
         };
-        // 拉起信令(已运行则先停)
-        {
+        // 拉起信令(已运行则先显式触发停止，避免在途 Arc 克隆挂起或撞 duplicate_login)
+        let old_signal = {
             let mut slot = rt.signal.lock().unwrap_or_else(|e| e.into_inner());
-            drop(slot.take());
+            slot.take()
+        };
+        if let Some(old) = old_signal {
+            old.request_stop();
+            drop(old);
+        }
+        {
             let hostname = req
                 .hostname
                 .clone()
@@ -440,6 +464,7 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
                 },
                 |_| {},
             );
+            let mut slot = rt.signal.lock().unwrap_or_else(|e| e.into_inner());
             *slot = Some(Arc::new(handle));
         }
         Ok(serde_json::json!({
@@ -450,14 +475,23 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
     })
 }
 
-/// 停止信令连接。
+/// 停止信令连接（显式通知停止后再释放，避免在途阻塞请求持有的 `Arc` 挂起或滞留旧连接）。
 #[no_mangle]
 pub extern "C" fn rc_signal_stop() -> *mut c_char {
-    with_runtime(|rt| {
+    let old_signal = {
+        let guard = lock_rt();
+        let Some(rt) = guard.as_ref() else {
+            return FfiError::runtime_not_initialized("运行时尚未初始化,请先调用 rc_runtime_init")
+                .into_c_string();
+        };
         let mut slot = rt.signal.lock().unwrap_or_else(|e| e.into_inner());
-        drop(slot.take());
-        Ok(serde_json::json!({ "ok": true }))
-    })
+        slot.take()
+    };
+    if let Some(old) = old_signal {
+        old.request_stop();
+        drop(old);
+    }
+    to_c_string(serde_json::json!({ "ok": true }).to_string())
 }
 
 // ── 一键连接设备 ──
@@ -501,6 +535,100 @@ fn default_timeout() -> u64 {
     15
 }
 
+const DEFAULT_WOL_TIMEOUT_MS: u32 = 10_000;
+const MAX_WOL_TIMEOUT_MS: u32 = 60_000;
+
+/// 钳位 Wake-on-LAN 等待超时毫秒数：`0` 回退至 `10_000ms`，大于 `60_000ms` 钳位至 `60_000ms`。
+pub(crate) fn effective_wol_timeout_ms(timeout_ms: u32) -> u32 {
+    if timeout_ms == 0 {
+        DEFAULT_WOL_TIMEOUT_MS
+    } else {
+        timeout_ms.min(MAX_WOL_TIMEOUT_MS)
+    }
+}
+
+fn ui_error_kind(ui_error: &UiError) -> &'static str {
+    if ui_error.code == codes::AUTH_TOKEN_REUSE_DETECTED {
+        "token_reuse"
+    } else if matches!(
+        ui_error.code.as_str(),
+        codes::AUTH_UNAUTHORIZED
+            | codes::AUTH_TOKEN_EXPIRED
+            | codes::AUTH_TOKEN_REVOKED
+            | codes::AUTH_RELOGIN_REQUIRED
+    ) {
+        "unauthorized"
+    } else {
+        "other"
+    }
+}
+
+pub(crate) fn normalize_wol_ack_for_ios(mut ack: WolAckResult) -> WolAckResult {
+    ack.ui_error = ack.ui_error.map(normalize_ui_error_for_ios);
+    ack
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_signal_for_unit_test(
+    handle: SignalClientHandle,
+) -> Arc<SignalClientHandle> {
+    let arc = Arc::new(handle);
+    let old_signal = {
+        let guard = lock_rt();
+        let rt = guard
+            .as_ref()
+            .expect("install_test_signal_for_unit_test requires rc_runtime_init first");
+        let mut slot = rt.signal.lock().unwrap_or_else(|e| e.into_inner());
+        slot.replace(Arc::clone(&arc))
+    };
+    if let Some(old) = old_signal {
+        old.request_stop();
+        drop(old);
+    }
+    arc
+}
+
+// ── 出站网络代理（进程级全局配置，可在 rc_runtime_init 前调用）──
+
+/// 更新进程级活跃出站代理配置（`ProxyConfig` JSON，camelCase 字段）。
+///
+/// - 反序列化并调用 `ProxyConfig::validate()` 严格校验；
+/// - 校验通过后对比 `active_proxy_config() != cfg` 再写入
+///   `rc_client_core::proxy::set_global_proxy_config(...)`；若配置发生变更且存在运行中的
+///   `SignalClientHandle`，释放全部锁后自动触发快速重连以切换至新代理路径；
+/// - 校验或解析失败时返回标准 iOS `ui_error` 信封，绝不在任何返回或错误字段中泄露代理密码；
+/// - 调用方必须经 `rc_string_free` 释放返回字符串。
+#[no_mangle]
+pub extern "C" fn rc_proxy_set_config_json(config_json: *const c_char) -> *mut c_char {
+    let Some(raw) = read_c_str(config_json) else {
+        return FfiError::invalid_json("缺少代理配置 JSON 参数").into_c_string();
+    };
+    let cfg: ProxyConfig = match serde_json::from_str(raw) {
+        Ok(cfg) => cfg,
+        // 不回显 serde_json 原始 token，防止格式错误 JSON 中的代理密码明文进入错误信封。
+        Err(_) => return FfiError::invalid_json("代理配置 JSON 格式无效").into_c_string(),
+    };
+    if let Err(err) = cfg.validate() {
+        let ui_error = err.to_ui_error(MOBILE_ERROR_PLATFORM);
+        return FfiError::from_ui_error(err.to_string(), "other", ui_error).into_c_string();
+    }
+    let changed = active_proxy_config() != cfg;
+    set_global_proxy_config(cfg);
+    if changed {
+        let active_signal = {
+            let guard = lock_rt();
+            guard.as_ref().and_then(|rt| {
+                let slot = rt.signal.lock().unwrap_or_else(|e| e.into_inner());
+                slot.as_ref().map(Arc::clone)
+            })
+        };
+        if let Some(handle) = active_signal {
+            handle.trigger_reconnect("出站代理配置变更");
+        }
+    }
+    to_c_string(serde_json::json!({ "ok": true }).to_string())
+}
+
 /// 查询当前信令状态快照（含 `uiError` 结构化模型）。
 #[no_mangle]
 pub extern "C" fn rc_signal_status(_json: *const c_char) -> *mut c_char {
@@ -516,6 +644,75 @@ pub extern "C" fn rc_signal_status(_json: *const c_char) -> *mut c_char {
         }
         None => FfiError::signal_not_started("信令未启动").into_c_string(),
     }
+}
+
+/// 向服务端发起 Wake-on-LAN 远程开机请求（阻塞式，禁止主线程调用）。
+///
+/// - `target_device_id`: 目标 9 位设备码（允许带空格格式化）；
+/// - `timeout_ms`: 等待 `wol_ack` 超时毫秒数（传 0 默认 10000ms，上限 60000ms）；
+/// - 收到服务端应答时返回 `WolAckResult` JSON（camelCase 字段，失败态同步附带归一化 iOS `uiError`）；
+/// - 入参非法、运行时未初始化、信令未启动、写帧失败或超时/断线时返回标准 iOS `ui_error` 信封；
+/// - 调用方必须经 `rc_string_free` 释放返回字符串。
+#[no_mangle]
+pub extern "C" fn rc_signal_request_wol(
+    target_device_id: *const c_char,
+    timeout_ms: u32,
+) -> *mut c_char {
+    let Some(raw_target) = read_c_str(target_device_id) else {
+        return FfiError::invalid_input("缺少目标设备码").into_c_string();
+    };
+    let trimmed = raw_target.trim();
+    if trimmed.is_empty() {
+        return FfiError::invalid_input("目标设备码不能为空").into_c_string();
+    }
+    let signal = {
+        let guard = lock_rt();
+        let Some(rt) = guard.as_ref() else {
+            return FfiError::runtime_not_initialized("运行时尚未初始化,请先调用 rc_runtime_init")
+                .into_c_string();
+        };
+        let slot = rt.signal.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(handle) = slot.as_ref() else {
+            return FfiError::signal_not_started("信令未启动,请先 rc_signal_start").into_c_string();
+        };
+        Arc::clone(handle)
+    };
+    let timeout = Duration::from_millis(u64::from(effective_wol_timeout_ms(timeout_ms)));
+    match signal.request_wol(trimmed, timeout) {
+        Ok(ack) => {
+            let normalized = normalize_wol_ack_for_ios(ack);
+            to_c_string(serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string()))
+        }
+        Err(ui_err) => {
+            let ui_error = normalize_ui_error_for_ios(ui_err);
+            let kind = ui_error_kind(&ui_error);
+            let msg = ui_error
+                .detail
+                .clone()
+                .unwrap_or_else(|| ui_error.message.clone());
+            FfiError::from_ui_error(msg, kind, ui_error).into_c_string()
+        }
+    }
+}
+
+/// 返回当前已缓存的同账号设备 Wake-on-LAN 能力快照 JSON 对象（键为 9 位规范设备码，值为 bool）。
+///
+/// 运行时未初始化或信令未启动时返回 `"{}"`。调用方必须经 `rc_string_free` 释放返回字符串。
+#[no_mangle]
+pub extern "C" fn rc_signal_wol_capable_snapshot_json() -> *mut c_char {
+    let snapshot: BTreeMap<String, bool> = {
+        let guard = lock_rt();
+        guard
+            .as_ref()
+            .and_then(|rt| {
+                let slot = rt.signal.lock().unwrap_or_else(|e| e.into_inner());
+                slot.as_ref().map(|h| h.device_wol_capable_snapshot())
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    };
+    to_c_string(serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string()))
 }
 
 /// 一键连接设备:信令 request_connect → 组装路由/mTLS/免密票据 → 开会话。

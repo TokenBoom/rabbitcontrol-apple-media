@@ -1,7 +1,8 @@
 name: Release xcframework
 
-# tag(push v*)或手动触发:构建 iOS 预编译产物 RabbitControlCore.xcframework 并发布到 GitHub Release。
-# iOS 仓 CI 直接下载该产物,不再现场编译 Rust。
+# tag(push v*)、手动触发(workflow_dispatch)或 core 发版联动(repository_dispatch):
+# 构建 iOS 预编译产物 RabbitControlCore.xcframework.tar.gz + SHA256SUMS.txt，
+# 并按触发来源发布到本仓 GitHub Release 或回传至 TokenBoom/rabbitcontrol-core 对应 Release。
 on:
   push:
     tags: ["v*"]
@@ -10,9 +11,12 @@ on:
       release_tag:
         description: "发布到哪个 tag(须已存在或随本次创建)"
         required: true
+  repository_dispatch:
+    types:
+      - rabbitcontrol-core-release
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
@@ -21,11 +25,75 @@ jobs:
   build:
     runs-on: macos-latest
     timeout-minutes: 60
+    outputs:
+      mode: ${{ steps.target.outputs.mode }}
+      local_tag: ${{ steps.target.outputs.local_tag }}
+      core_tag: ${{ steps.target.outputs.core_tag }}
     steps:
+      - name: Resolve release target
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+          PAYLOAD_VERSION: ${{ github.event.client_payload.version }}
+          PAYLOAD_COMMIT: ${{ github.event.client_payload.commit }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "repository_dispatch" ]; then
+            CORE_TAG="${PAYLOAD_TAG}"
+            if [ -z "${CORE_TAG}" ] && [ -n "${PAYLOAD_VERSION}" ]; then
+              CORE_TAG="v${PAYLOAD_VERSION#v}"
+            fi
+            if [ -z "${CORE_TAG}" ]; then
+              echo "::error::repository_dispatch payload must provide 'tag' or 'version'."
+              exit 1
+            fi
+            if [[ ! "${CORE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+              echo "::error::Invalid core release tag format: ${CORE_TAG}"
+              exit 1
+            fi
+            CORE_COMMIT=""
+            if [ -n "${PAYLOAD_COMMIT}" ]; then
+              if [[ ! "${PAYLOAD_COMMIT}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+                echo "::error::Invalid core commit SHA format: ${PAYLOAD_COMMIT}"
+                exit 1
+              fi
+              CORE_COMMIT="$(printf '%s' "${PAYLOAD_COMMIT}" | tr '[:upper:]' '[:lower:]')"
+            fi
+            echo "mode=core-dispatch" >> "${GITHUB_OUTPUT}"
+            echo "core_tag=${CORE_TAG}" >> "${GITHUB_OUTPUT}"
+            echo "core_commit=${CORE_COMMIT}" >> "${GITHUB_OUTPUT}"
+          elif [ "${EVENT_NAME}" = "push" ]; then
+            LOCAL_TAG="${REF_NAME}"
+            if [[ ! "${LOCAL_TAG}" =~ ^v[0-9A-Za-z]+([._-][0-9A-Za-z]+)*$ ]]; then
+              echo "::error::Invalid push tag format: ${LOCAL_TAG}"
+              exit 1
+            fi
+            echo "mode=local-release" >> "${GITHUB_OUTPUT}"
+            echo "local_tag=${LOCAL_TAG}" >> "${GITHUB_OUTPUT}"
+          else
+            LOCAL_TAG="${INPUT_RELEASE_TAG}"
+            if [ -z "${LOCAL_TAG}" ] || [ "${LOCAL_TAG}" = "main" ]; then
+              echo "::error::workflow_dispatch requires a valid non-main release_tag."
+              exit 1
+            fi
+            if [[ ! "${LOCAL_TAG}" =~ ^[A-Za-z0-9]+([._-][A-Za-z0-9]+)*$ ]]; then
+              echo "::error::Invalid release_tag format: ${LOCAL_TAG}"
+              exit 1
+            fi
+            echo "mode=local-release" >> "${GITHUB_OUTPUT}"
+            echo "local_tag=${LOCAL_TAG}" >> "${GITHUB_OUTPUT}"
+          fi
+
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust iOS targets
         run: |
+          set -euo pipefail
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
@@ -33,8 +101,114 @@ jobs:
         env:
           CORE_READ_TOKEN: ${{ secrets.CORE_READ_TOKEN }}
         run: |
-          # rabbitcontrol-core 为私有仓:cargo 的 git+tag 依赖拉取需要读权限。
-          git config --global url."https://x-access-token:${CORE_READ_TOKEN}@github.com/".insteadOf "https://github.com/"
+          set -euo pipefail
+          if [ -n "${CORE_READ_TOKEN}" ]; then
+            # rabbitcontrol-core 为私有仓时:cargo 的 git+tag 依赖拉取需要读权限。
+            git config --global url."https://x-access-token:${CORE_READ_TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+
+      - name: Pin rabbitcontrol-core to dispatched tag
+        if: steps.target.outputs.mode == 'core-dispatch'
+        env:
+          CORE_TAG: ${{ steps.target.outputs.core_tag }}
+          CORE_COMMIT: ${{ steps.target.outputs.core_commit }}
+        run: |
+          set -euo pipefail
+          if [ -e .cargo/config.toml ]; then
+            echo "::error::Unexpected .cargo/config.toml present in CI workspace; refusing to build with local overrides."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+
+          core_tag = os.environ["CORE_TAG"]
+          cargo_toml = pathlib.Path("Cargo.toml")
+          lines = cargo_toml.read_text(encoding="utf-8").splitlines(keepends=True)
+
+          core_url = "https://github.com/TokenBoom/rabbitcontrol-core.git"
+          tag_re = re.compile(r'(\btag\s*=\s*")[^"]+(")')
+          total_core_lines = 0
+          replaced_lines = 0
+          out_lines = []
+
+          for line in lines:
+              if core_url in line:
+                  total_core_lines += 1
+                  new_line, n = tag_re.subn(rf'\g<1>{core_tag}\g<2>', line, count=1)
+                  if n != 1:
+                      sys.exit(f"ERROR: rabbitcontrol-core dependency missing tag field: {line.strip()}")
+                  replaced_lines += 1
+                  out_lines.append(new_line)
+              else:
+                  out_lines.append(line)
+
+          if total_core_lines == 0 or replaced_lines != total_core_lines:
+              sys.exit(f"ERROR: expected >0 rewritten rabbitcontrol-core deps, got {replaced_lines}/{total_core_lines}")
+
+          cargo_toml.write_text("".join(out_lines), encoding="utf-8")
+          print(f"Pinned {replaced_lines} rabbitcontrol-core dependencies in Cargo.toml to tag={core_tag}")
+          PY
+
+          cargo metadata --format-version 1 >/dev/null
+
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+
+          core_tag = os.environ["CORE_TAG"]
+          core_commit = os.environ.get("CORE_COMMIT", "").strip().lower()
+          expected_prefix = f"git+https://github.com/TokenBoom/rabbitcontrol-core.git?tag={core_tag}#"
+          lock_text = pathlib.Path("Cargo.lock").read_text(encoding="utf-8")
+
+          packages = []
+          try:
+              import tomllib
+              packages = tomllib.loads(lock_text).get("package", [])
+          except ModuleNotFoundError:
+              current = None
+              for raw in lock_text.splitlines():
+                  line = raw.strip()
+                  if line == "[[package]]":
+                      if current is not None:
+                          packages.append(current)
+                      current = {}
+                  elif current is not None:
+                      m = re.match(r'^([a-zA-Z0-9_-]+)\s*=\s*"([^"]*)"$', line)
+                      if m:
+                          current[m.group(1)] = m.group(2)
+              if current is not None:
+                  packages.append(current)
+
+          matched = []
+          for pkg in packages:
+              source = pkg.get("source", "")
+              if "TokenBoom/rabbitcontrol-core.git" in source:
+                  if not source.startswith(expected_prefix):
+                      sys.exit(
+                          f"ERROR: Cargo.lock package {pkg.get('name')} has mismatched source {source!r} "
+                          f"(expected prefix {expected_prefix!r})"
+                      )
+                  locked_commit = source.split("#", 1)[1].lower()
+                  if not re.fullmatch(r"[0-9a-f]{40}", locked_commit):
+                      sys.exit(f"ERROR: Cargo.lock package {pkg.get('name')} has invalid commit {locked_commit!r}")
+                  if core_commit and locked_commit != core_commit:
+                      sys.exit(
+                          f"ERROR: Cargo.lock package {pkg.get('name')} commit {locked_commit} "
+                          f"does not match dispatched commit {core_commit}"
+                      )
+                  matched.append((pkg.get("name", "<unknown>"), pkg.get("version", "<unknown>"), locked_commit))
+
+          if not matched:
+              sys.exit("ERROR: no TokenBoom/rabbitcontrol-core.git entries found in Cargo.lock")
+          names = {name for name, _, _ in matched}
+          if "rc-client-core" not in names:
+              sys.exit(f"ERROR: rc-client-core missing from locked rabbitcontrol-core packages: {sorted(names)}")
+
+          commits = {commit for _, _, commit in matched}
+          if len(commits) != 1:
+              sys.exit(f"ERROR: inconsistent rabbitcontrol-core commits in Cargo.lock: {sorted(commits)}")
+          print(f"Verified {len(matched)} Cargo.lock rabbitcontrol-core packages pinned to {core_tag} ({next(iter(commits))})")
+          PY
 
       - name: Build & package xcframework
         env:
@@ -44,15 +218,97 @@ jobs:
 
       - name: Verify archive checksums
         run: |
+          set -euo pipefail
           cd build
           shasum -a 256 -c SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Upload to release
+      - name: Upload xcframework artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: xcframework-archive
+          path: |
+            build/RabbitControlCore.xcframework.tar.gz
+            build/SHA256SUMS.txt
+          retention-days: 1
+          if-no-files-found: error
+
+  publish-local:
+    needs: build
+    if: needs.build.outputs.mode == 'local-release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download xcframework artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: xcframework-archive
+          path: build
+
+      - name: Verify archive checksums
+        run: |
+          set -euo pipefail
+          cd build
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Upload to local release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOCAL_REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ needs.build.outputs.local_tag }}
         run: |
-          TAG="${{ github.ref_name }}"
-          if [ "$TAG" = "main" ] || [ -z "$TAG" ]; then TAG="${{ inputs.release_tag }}"; fi
-          gh release create "$TAG" --title "$TAG" --notes "预编译 RabbitControlCore.xcframework" 2>/dev/null || true
-          gh release upload "$TAG" build/RabbitControlCore.xcframework.tar.gz build/SHA256SUMS.txt --clobber
+          set -euo pipefail
+          if ! gh release view "${RELEASE_TAG}" --repo "${LOCAL_REPO}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --repo "${LOCAL_REPO}" \
+              --target "${TARGET_SHA}" \
+              --title "${RELEASE_TAG}" \
+              --notes "预编译 RabbitControlCore.xcframework"
+          fi
+          gh release upload "${RELEASE_TAG}" \
+            --repo "${LOCAL_REPO}" \
+            build/RabbitControlCore.xcframework.tar.gz \
+            build/SHA256SUMS.txt \
+            --clobber
+
+  publish-core:
+    needs: build
+    if: needs.build.outputs.mode == 'core-dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Download xcframework artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: xcframework-archive
+          path: build
+
+      - name: Verify archive checksums
+        run: |
+          set -euo pipefail
+          cd build
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Upload assets to TokenBoom/rabbitcontrol-core release
+        env:
+          GH_TOKEN: ${{ secrets.CORE_RELEASE_TOKEN }}
+          CORE_TAG: ${{ needs.build.outputs.core_tag }}
+          CORE_REPO: "TokenBoom/rabbitcontrol-core"
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::CORE_RELEASE_TOKEN is not configured; skipping upload of RabbitControlCore.xcframework.tar.gz and checksum to ${CORE_REPO} release ${CORE_TAG}."
+            exit 0
+          fi
+          cp build/SHA256SUMS.txt build/RabbitControlCore.xcframework.tar.gz.sha256
+          gh release view "${CORE_TAG}" --repo "${CORE_REPO}" >/dev/null
+          gh release upload "${CORE_TAG}" \
+            --repo "${CORE_REPO}" \
+            build/RabbitControlCore.xcframework.tar.gz \
+            build/RabbitControlCore.xcframework.tar.gz.sha256 \
+            --clobber
