@@ -15,7 +15,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rc_capture::FrameTexture;
 use rc_decode::DecodedFrame;
-use rc_pipeline::{PipelineConfig, PlatformMediaProvider};
+use rc_encode::{BitstreamFormat, Codec};
+use rc_pipeline::{
+    ChromaSubsampling, CodecCapability, LatencyTier, PipelineConfig, PlatformMediaProvider,
+};
 use rc_render::Renderer;
 use rc_types::{Error, Result, Timestamp};
 
@@ -179,6 +182,15 @@ impl Renderer for FramePumpRenderer {
 
 struct AppleMediaProvider;
 
+impl AppleMediaProvider {
+    fn supports_av1_decode(&self) -> bool {
+        if std::env::var_os("RC_DISABLE_AV1").is_some() {
+            return false;
+        }
+        !cfg!(target_abi = "sim") && rc_decode_vt::supports_hardware_av1_decode()
+    }
+}
+
 impl PlatformMediaProvider for AppleMediaProvider {
     fn supports_hevc(&self) -> bool {
         // iOS 模拟器的 VideoToolbox 无 HEVC 硬解,默认回退 H.264;真机正常走 HEVC。
@@ -192,19 +204,76 @@ impl PlatformMediaProvider for AppleMediaProvider {
         !cfg!(target_abi = "sim")
     }
 
+    fn encode_capabilities(&self) -> Vec<CodecCapability> {
+        // iOS / Apple 移动端媒体库当前仅作为纯主控端使用，未注册硬件编码后端，
+        // 返回空编码能力清单（严禁虚报 AV1/HEVC/H.264 硬件编码能力）。
+        Vec::new()
+    }
+
+    fn decode_capabilities(&self) -> Vec<CodecCapability> {
+        let mut caps = Vec::with_capacity(3);
+        if self.supports_av1_decode() {
+            caps.push(CodecCapability {
+                codec: Codec::Av1,
+                hardware: true,
+                max_width: 5120,
+                max_height: 2880,
+                max_pixel_rate: 500_000_000,
+                screen_content_tools: true,
+                chroma: ChromaSubsampling::Yuv420,
+                latency_tier: LatencyTier::Low,
+            });
+        }
+        if self.supports_hevc() {
+            caps.push(CodecCapability {
+                codec: Codec::Hevc,
+                hardware: true,
+                max_width: 5120,
+                max_height: 2880,
+                max_pixel_rate: 600_000_000,
+                screen_content_tools: false,
+                chroma: ChromaSubsampling::Yuv420,
+                latency_tier: LatencyTier::UltraLow,
+            });
+        }
+        caps.push(CodecCapability {
+            codec: Codec::H264,
+            hardware: true,
+            max_width: 4096,
+            max_height: 2304,
+            max_pixel_rate: 280_000_000,
+            screen_content_tools: false,
+            chroma: ChromaSubsampling::Yuv420,
+            latency_tier: LatencyTier::UltraLow,
+        });
+        caps
+    }
+
     fn create_decoder(
         &self,
         cfg: &PipelineConfig,
     ) -> Result<(Box<dyn rc_decode::Decoder>, &'static str)> {
+        if cfg.codec == Codec::Av1 && !self.supports_av1_decode() {
+            return Err(Error::Decoder(
+                "Apple VideoToolbox 不支持本机 AV1 硬件解码".to_string(),
+            ));
+        }
+        let bitstream_format = match cfg.codec {
+            Codec::Av1 => BitstreamFormat::Obu,
+            Codec::H264 | Codec::Hevc => BitstreamFormat::AnnexB,
+        };
         let decoder = rc_decode_vt::new_decoder(rc_decode_vt::VtDecoderConfig {
             codec: cfg.codec,
+            bitstream_format,
             max_resolution: rc_types::Resolution::new(
-                cfg.resolution.width.max(4096),
+                cfg.resolution.width.max(5120),
                 cfg.resolution.height.max(4096),
             ),
-            ..rc_decode_vt::VtDecoderConfig::default()
         })
-        .map_err(|e| Error::InvalidConfig(format!("vt decoder init: {e}")))?;
+        .map_err(|e| match e {
+            Error::Decoder(msg) => Error::Decoder(msg),
+            other => Error::InvalidConfig(format!("vt decoder init: {other}")),
+        })?;
         Ok((Box::new(decoder), "videotoolbox"))
     }
 }
@@ -262,6 +331,8 @@ pub extern "C" fn rc_apple_media_init() -> i32 {
         clipboard::register();
     }
     let hooks_ok = rc_client_core::platform::register_platform_hooks(Arc::new(AppleMediaHooks));
+    #[cfg(not(test))]
+    let _ = rc_client_core::codec_selector::trigger_default_hardware_caps_probe();
     if provider_ok && hooks_ok {
         1
     } else {
@@ -382,6 +453,63 @@ mod tests {
                 super::rc_apple_media_frame_release(out.ptr);
             }
             assert!(!super::rc_apple_media_frame_take_raw(&mut out));
+        }
+    }
+
+    #[test]
+    fn asymmetric_capabilities_and_av1_decoder_factory() {
+        use super::*;
+        let provider = AppleMediaProvider;
+
+        // 纯主控端不虚报编码能力（特别不虚报 AV1 硬编）。
+        let enc_caps = provider.encode_capabilities();
+        assert!(
+            enc_caps.is_empty(),
+            "iOS/Apple 纯主控媒体提供者不应虚报硬件编码能力，实际 {enc_caps:?}"
+        );
+
+        let dec_caps = provider.decode_capabilities();
+        assert!(
+            dec_caps
+                .iter()
+                .any(|c| c.codec == Codec::H264 && c.hardware),
+            "解码能力必须包含 H.264 硬解"
+        );
+        if provider.supports_hevc() {
+            assert!(
+                dec_caps
+                    .iter()
+                    .any(|c| c.codec == Codec::Hevc && c.hardware),
+                "支持 HEVC 时解码能力必须包含 HEVC 硬解"
+            );
+        }
+        let av1_cap = dec_caps.iter().find(|c| c.codec == Codec::Av1);
+        if provider.supports_av1_decode() {
+            let cap = av1_cap.expect("支持 AV1 硬解时必须上报 AV1 解码能力");
+            assert!(cap.hardware);
+            assert!(cap.screen_content_tools);
+        } else {
+            assert!(
+                av1_cap.is_none(),
+                "不支持 AV1 硬解的设备（如 M1/M2）不得上报 AV1 解码能力"
+            );
+        }
+
+        // create_decoder 校验：H.264 正常创建；AV1 依据本机硬件探测决定成功或明确报 Error::Decoder。
+        let h264_res = provider.create_decoder(&PipelineConfig {
+            codec: Codec::H264,
+            ..PipelineConfig::default()
+        });
+        assert!(h264_res.is_ok());
+
+        let av1_res = provider.create_decoder(&PipelineConfig {
+            codec: Codec::Av1,
+            ..PipelineConfig::default()
+        });
+        if provider.supports_av1_decode() {
+            assert!(av1_res.is_ok());
+        } else {
+            assert!(matches!(av1_res, Err(Error::Decoder(_))));
         }
     }
 }

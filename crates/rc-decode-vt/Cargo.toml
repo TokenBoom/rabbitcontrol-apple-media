@@ -19,7 +19,7 @@ rc-types = { workspace = true }
 # 版本线与 rc-encode-vt 严格一致（objc2 生态 0.6 / 绑定 0.3），
 # 两条平台 crate 共享同一批编译产物。
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-objc2-core-foundation = { version = "0.3", features = ["CFDictionary", "CFNumber", "CFString"] }
+objc2-core-foundation = { version = "0.3", features = ["CFData", "CFDictionary", "CFNumber", "CFString"] }
 objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 

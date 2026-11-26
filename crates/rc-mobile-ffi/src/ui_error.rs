@@ -737,6 +737,64 @@ mod tests {
     }
 
     #[test]
+    fn session_command_and_display_config_support_av1() {
+        use rc_client_core::display_ctrl::{HighRefreshAdvisory, StreamCodec};
+        use rc_client_core::session_bridge::SessionCommand;
+
+        // 1) SessionCommand::SetCodec JSON 反序列化支持 "av1" / "hevc" / "h264"
+        for (wire, expected) in [
+            ("av1", StreamCodec::Av1),
+            ("hevc", StreamCodec::Hevc),
+            ("h264", StreamCodec::H264),
+        ] {
+            let cmd: SessionCommand =
+                serde_json::from_str(&format!(r#"{{"type":"set_codec","codec":"{wire}"}}"#))
+                    .expect("SetCodec JSON must deserialize");
+            assert_eq!(cmd, SessionCommand::SetCodec { codec: expected });
+        }
+
+        // 2) rc_session_command 对活跃会话接受 {"type":"set_codec","codec":"av1"}
+        let open_req = CString::new(r#"{"connect_addr":"127.0.0.1:1"}"#).unwrap();
+        let open_val = take_json(rc_session_open(open_req.as_ptr()));
+        let sid = open_val["session_id"]
+            .as_u64()
+            .expect("rc_session_open must return session_id");
+
+        let av1_cmd = CString::new(format!(
+            r#"{{"session_id":{sid},"command":{{"type":"set_codec","codec":"av1"}}}}"#
+        ))
+        .unwrap();
+        let cmd_val = take_json(rc_session_command(av1_cmd.as_ptr()));
+        assert_eq!(cmd_val["ok"], serde_json::json!(true));
+
+        let close_req = CString::new(format!(r#"{{"session_id":{sid}}}"#)).unwrap();
+        let _ = take_json(rc_session_close(close_req.as_ptr()));
+
+        // 3) SessionUpdate::DisplayConfig 透传 "av1" 与支持列表
+        let cfg_update = SessionUpdate::DisplayConfig {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            native_width: 1920,
+            native_height: 1080,
+            max_fps: 120,
+            presets: Vec::new(),
+            codec: Some("av1".to_string()),
+            supported_codecs: vec!["av1".to_string(), "hevc".to_string(), "h264".to_string()],
+            client_supports_hevc: true,
+            advisory: HighRefreshAdvisory::default(),
+        };
+        let normalized = normalize_session_update_for_ios(cfg_update);
+        let cfg_json = serde_json::to_value(&normalized).unwrap();
+        assert_eq!(cfg_json["kind"], "display_config");
+        assert_eq!(cfg_json["data"]["codec"], "av1");
+        assert_eq!(
+            cfg_json["data"]["supported_codecs"],
+            serde_json::json!(["av1", "hevc", "h264"])
+        );
+    }
+
+    #[test]
     fn session_update_tool_permissions_and_ended_json_serialization() {
         // 1) ToolPermissionsUpdated
         let perms = ToolPermissions {

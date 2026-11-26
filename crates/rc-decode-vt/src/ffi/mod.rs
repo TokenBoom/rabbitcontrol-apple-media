@@ -40,10 +40,15 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use objc2_core_foundation::{CFBoolean, CFRetained, CFString};
+use objc2_core_foundation::{
+    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFBoolean, CFData,
+    CFDictionary, CFRetained, CFString,
+};
 use objc2_core_media::{
-    kCMBlockBufferAlwaysCopyDataFlag, CMBlockBuffer, CMFormatDescription, CMSampleBuffer,
-    CMSampleTimingInfo, CMTime, CMTimeFlags, CMVideoFormatDescriptionCreateFromH264ParameterSets,
+    kCMBlockBufferAlwaysCopyDataFlag,
+    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms, CMBlockBuffer,
+    CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags,
+    CMVideoFormatDescriptionCreate, CMVideoFormatDescriptionCreateFromH264ParameterSets,
     CMVideoFormatDescriptionCreateFromHEVCParameterSets, CMVideoFormatDescriptionGetDimensions,
 };
 use objc2_core_video::{CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth};
@@ -53,6 +58,9 @@ use crate::mailbox::FrameMailbox;
 /// `OSStatus`（CFBase.h：`typedef int32_t OSStatus`）。core-media 绑定把它
 /// 保持为 crate 私有，这里自行定义同名别名（与 rc-encode-vt 的 ffi 一致）。
 pub(crate) type OSStatus = i32;
+
+/// `kCMVideoCodecType_AV1 = 'av01'`（CoreMedia/CMFormatDescription.h）。
+const K_CM_VIDEO_CODEC_TYPE_AV1: u32 = u32::from_be_bytes(*b"av01");
 
 /// `kVTPropertyNotSupportedErr`（VTErrors.h）：属性被当前解码器拒绝。
 const K_VT_PROPERTY_NOT_SUPPORTED_ERR: OSStatus = -12900;
@@ -183,6 +191,9 @@ mod raw {
         ) -> OSStatus;
         pub fn VTDecompressionSessionWaitForAsynchronousFrames(session: *mut c_void) -> OSStatus;
         pub fn VTDecompressionSessionInvalidate(session: *mut c_void);
+        /// `Boolean VTIsHardwareDecodeSupported(CMVideoCodecType codecType)`
+        /// （VTDecompressionSession.h，API_AVAILABLE(macos(10.13), ios(11.0))）。
+        pub fn VTIsHardwareDecodeSupported(codec_type: u32) -> u8;
     }
 
     // SAFETY: CoreFoundation 的 CFRelease，同样按 C 头文件声明（CFBase.h）。
@@ -190,6 +201,16 @@ mod raw {
     extern "C" {
         pub fn CFRelease(cf: *const c_void);
     }
+}
+
+/// 动态探测当前 Apple 设备是否支持 AV1 硬件解码（`VTIsHardwareDecodeSupported('av01')`）。
+///
+/// Apple Silicon M1/M2 返回 `false`，M3/M4/A17 Pro 及更新硬件返回 `true`。
+pub(crate) fn is_hardware_av1_decode_supported() -> bool {
+    // SAFETY: VTIsHardwareDecodeSupported 是 Apple VideoToolbox 线程安全只读查询 API
+    // （VTDecompressionSession.h，API_AVAILABLE(macos(10.13), ios(11.0))），仅接受值类型
+    // CMVideoCodecType ('av01')，不解引用任何指针，不转移内存所有权。
+    unsafe { raw::VTIsHardwareDecodeSupported(K_CM_VIDEO_CODEC_TYPE_AV1) != 0 }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -462,20 +483,163 @@ impl DecompressionSession {
         Self::from_format_description(desc).map_err(Ok)
     }
 
+    /// 从 ISO BMFF `av1C` 配置记录与帧尺寸构建 AV1 `CMVideoFormatDescription` 并创建硬件解码会话。
+    ///
+    /// 返回 `Err(Ok(msg))` 表示硬件/会话级不支持或失败（映射为 `Error::Decoder`），
+    /// 返回 `Err(Err(msg))` 表示 `av1C` 或尺寸非法（映射为 `Error::InvalidFrame`）。
+    /// 全程通过 `CFRetained` 管理 `CFData` / `CFDictionary` / `CMFormatDescription`，
+    /// 任何错误路径均零 `CFTypeRef` 泄漏。
+    pub(crate) fn new_av1(
+        av1c: &[u8],
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Self, Result<String, String>> {
+        if av1c.len() < 4 || av1c[0] != crate::av1_obu::AV1C_MARKER_VERSION {
+            return Err(Err(
+                "AV1 av1C 配置非法（长度不足 4 字节或 marker/version 不等于 0x81）".to_string(),
+            ));
+        }
+        if width == 0 || height == 0 || width > max_width || height > max_height {
+            return Err(Err(format!(
+                "AV1 Sequence Header 声明 {width}x{height} 超过解码上限 {max_width}x{max_height}"
+            )));
+        }
+        let width_i32 =
+            i32::try_from(width).map_err(|_| Err(format!("AV1 帧宽 {width} 超出 i32::MAX")))?;
+        let height_i32 =
+            i32::try_from(height).map_err(|_| Err(format!("AV1 帧高 {height} 超出 i32::MAX")))?;
+
+        if !is_hardware_av1_decode_supported() {
+            return Err(Ok(
+                "Apple VideoToolbox 不支持本机 AV1 硬件解码 (VTIsHardwareDecodeSupported('av01') == false)"
+                    .to_string(),
+            ));
+        }
+
+        // 1. 构造 { kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: { "av1C": CFData(av1c) } }
+        let av1c_data = CFData::from_bytes(av1c);
+        let av1c_key = CFString::from_static_str("av1C");
+        let atom_keys = [CFRetained::as_ptr(&av1c_key)
+            .as_ptr()
+            .cast_const()
+            .cast::<c_void>()];
+        let atom_vals = [CFRetained::as_ptr(&av1c_data)
+            .as_ptr()
+            .cast_const()
+            .cast::<c_void>()];
+        // SAFETY: atom_keys/atom_vals 长度一致（1），指向本栈帧存活的 CFString/CFData，
+        // 使用标准 CFType 回调由 CFDictionary 自动 retain/release。
+        let atoms_dict = unsafe {
+            CFDictionary::new(
+                None,
+                atom_keys.as_ptr() as *mut *const c_void,
+                atom_vals.as_ptr() as *mut *const c_void,
+                1,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
+        }
+        .ok_or_else(|| Ok("创建 AV1 SampleDescriptionExtensionAtoms 字典失败".to_string()))?;
+
+        // SAFETY: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms 为 CoreMedia
+        // 框架静态只读 CFString 常量（API_AVAILABLE(macos(10.7), ios(4.0))），只读无竞争。
+        let ext_atoms_key =
+            unsafe { kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms };
+        let ext_keys = [ext_atoms_key as *const CFString as *const c_void];
+        let ext_vals = [CFRetained::as_ptr(&atoms_dict)
+            .as_ptr()
+            .cast_const()
+            .cast::<c_void>()];
+        // SAFETY: ext_keys/ext_vals 长度一致（1），指向合法 CFString 与存活的 atoms_dict。
+        let extensions = unsafe {
+            CFDictionary::new(
+                None,
+                ext_keys.as_ptr() as *mut *const c_void,
+                ext_vals.as_ptr() as *mut *const c_void,
+                1,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
+        }
+        .ok_or_else(|| Ok("创建 AV1 FormatDescription extensions 字典失败".to_string()))?;
+
+        // 2. CMVideoFormatDescriptionCreate('av01', width, height, extensions)
+        let mut desc_out: *const CMFormatDescription = std::ptr::null();
+        // SAFETY: extensions 为合法 CFDictionary，desc_out 为本栈帧合法出参；CoreMedia
+        // 同步深拷贝 extensions，调用返回后 extensions/atoms_dict/av1c_data 均可安全释放。
+        let status = unsafe {
+            CMVideoFormatDescriptionCreate(
+                None,
+                K_CM_VIDEO_CODEC_TYPE_AV1,
+                width_i32,
+                height_i32,
+                Some(&extensions),
+                NonNull::from(&mut desc_out),
+            )
+        };
+        if status != 0 {
+            return Err(Ok(format!(
+                "CMVideoFormatDescriptionCreate(av01) 失败: OSStatus {status}"
+            )));
+        }
+        // SAFETY: Create 成功（status == 0）时 desc_out 是 +1 所有权引用，立即交由 CFRetained 托管。
+        let desc = NonNull::new(desc_out as *mut CMFormatDescription)
+            .map(|ptr| unsafe { CFRetained::from_raw(ptr) })
+            .ok_or_else(|| {
+                Ok("CMVideoFormatDescriptionCreate(av01) 返回 0 但描述为空".to_string())
+            })?;
+
+        // 3. 显式要求硬件 AV1 解码（通过静态 CFString 键构造，兼容 IPHONEOS_DEPLOYMENT_TARGET=13.0，
+        //    不会引入 iOS 17.0 强链接符号；且前面已由 VTIsHardwareDecodeSupported('av01') 兜底拦截）。
+        let require_hw_key = CFString::from_static_str("RequireHardwareAcceleratedVideoDecoder");
+        let require_hw_val = CFBoolean::new(true);
+        let spec_keys = [CFRetained::as_ptr(&require_hw_key)
+            .as_ptr()
+            .cast_const()
+            .cast::<c_void>()];
+        let spec_vals = [require_hw_val as *const CFBoolean as *const c_void];
+        // SAFETY: spec_keys/spec_vals 长度一致（1），指向存活的 CFString 与不可变单例 CFBoolean。
+        let decoder_spec = unsafe {
+            CFDictionary::new(
+                None,
+                spec_keys.as_ptr() as *mut *const c_void,
+                spec_vals.as_ptr() as *mut *const c_void,
+                1,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            )
+        }
+        .ok_or_else(|| Ok("创建 AV1 decoder_specification 字典失败".to_string()))?;
+
+        Self::from_format_description_with_spec(desc, Some(&decoder_spec)).map_err(Ok)
+    }
+
     fn from_format_description(desc: CFRetained<CMFormatDescription>) -> Result<Self, String> {
-        // 2. 建解码会话。decoder_specification / image_buffer_attributes 传
-        //    null：系统默认解码器（优先硬件、软件兜底，见模块文档的选择理由）；
-        //    输出格式由解码器原生决定（NV12 IOSurface），对零拷贝渲染最友好。
+        Self::from_format_description_with_spec(desc, None)
+    }
+
+    fn from_format_description_with_spec(
+        desc: CFRetained<CMFormatDescription>,
+        decoder_spec: Option<&CFDictionary>,
+    ) -> Result<Self, String> {
+        // 2. 建解码会话。H.264/HEVC 的 decoder_specification 为 null（系统默认优先硬件、
+        //    软件兜底，保持既有热路径完全不变）；AV1 传入显式硬件要求字典；
+        //    image_buffer_attributes 传 null，输出原生 NV12 IOSurface，对零拷贝渲染最友好。
         let cb_ctx = Arc::new(CallbackContext::new());
         let callback_record = VtDecompressionOutputCallbackRecord {
             callback: vt_decode_callback,
             refcon: Arc::as_ptr(&cb_ctx) as *mut c_void,
         };
+        let decoder_spec_ptr = decoder_spec.map_or(std::ptr::null(), |d| {
+            (d as *const CFDictionary).cast::<c_void>()
+        });
         let mut session_out: *mut c_void = std::ptr::null_mut();
-        // SAFETY: desc 是刚建的合法视频格式描述；两个可空参数传 null = 系统
-        // 默认；callback record 指向栈上存活的合法结构（Create 按值拷贝其
-        // 内容）；session_out 是本栈帧合法出参；refcon 指向 cb_ctx 的稳定
-        // 堆分配（由会话持有 Arc 克隆保活，见 Drop 顺序）。
+        // SAFETY: desc 是刚建的合法视频格式描述；decoder_spec_ptr 为 null 或本栈帧存活的
+        // 合法 CFDictionary；image_buffer_attributes 传 null；callback record 指向栈上存活
+        // 的合法结构（Create 按值拷贝其内容）；session_out 是本栈帧合法出参；refcon 指向
+        // cb_ctx 的稳定堆分配（由会话持有 Arc 克隆保活，见 Drop 顺序）。
         let status = unsafe {
             raw::VTDecompressionSessionCreate(
                 std::ptr::null(),
@@ -483,7 +647,7 @@ impl DecompressionSession {
                     .as_ptr()
                     .cast::<c_void>()
                     .cast_const(),
-                std::ptr::null(),
+                decoder_spec_ptr,
                 std::ptr::null(),
                 std::ptr::addr_of!(callback_record),
                 std::ptr::addr_of_mut!(session_out),

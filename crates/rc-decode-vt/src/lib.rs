@@ -52,6 +52,10 @@ pub(crate) mod h264;
 #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
 pub(crate) mod h265;
 
+/// AV1 OBU 解析 / Sequence Header 提取与 ISO BMFF `av1C` 构造（纯函数，跨平台可测）。
+#[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
+pub(crate) mod av1_obu;
+
 /// 帧序邮箱：解码回调 → 等待线程的单帧结果收集（D5 顺序核心，纯 Rust）。
 #[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
 pub(crate) mod mailbox;
@@ -104,20 +108,37 @@ impl RefChainGate {
     }
 }
 
+/// 动态探测当前 Apple 设备是否支持 AV1 硬件解码（`VTIsHardwareDecodeSupported('av01')`）。
+///
+/// - Apple Silicon M1/M2 及旧款设备返回 `false`；
+/// - Apple Silicon M3/M4、iPhone 15 Pro (A17 Pro) 及更新支持 AV1 硬解的设备返回 `true`；
+/// - 非 macOS/iOS 平台恒返回 `false`。
+pub fn supports_hardware_av1_decode() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        ffi::is_hardware_av1_decode_supported()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        false
+    }
+}
+
 /// 解码器配置。
 ///
 /// `bitstream_format` 必须与发送端 `EncoderCaps::bitstream_format` 的声明
-/// 一致（本后端只支持 Annex-B 输入，坑 #7）。
+/// 一致（H.264/HEVC 必须为 `AnnexB`，AV1 必须为 `Obu`，坑 #7）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VtDecoderConfig {
-    /// 目标编解码器（当前支持 H.264 与 HEVC/H.265）。
+    /// 目标编解码器（支持 H.264、HEVC/H.265 与 AV1）。
     pub codec: Codec,
-    /// 输入码流封装格式。**必须为 [`BitstreamFormat::AnnexB`]**：
-    /// 管线统一消费 Annex-B（rc-encode-vt 输出侧已重排并声明），本后端
-    /// 在内部转 AVCC/HVCC 喂 VideoToolbox——两种封装不能混用，不匹配在
-    /// 构造期报错而不是运行期花屏。
+    /// 输入码流封装格式：
+    /// - H.264 / HEVC **必须为 [`BitstreamFormat::AnnexB`]**（内部转 AVCC/HVCC 喂 VT）；
+    /// - AV1 **必须为 [`BitstreamFormat::Obu`]**（内部解析 `OBU_SEQUENCE_HEADER` 构造 `av1C`）。
+    ///
+    /// 不匹配在构造期报错而不是运行期花屏。
     pub bitstream_format: BitstreamFormat,
-    /// 接受的最大帧尺寸（SPS 声明超限的码流在进 FFI 前被拒绝，恶意/损坏
+    /// 接受的最大帧尺寸（SPS / Sequence Header 声明超限的码流在进 FFI 前被拒绝，恶意/损坏
     /// 码流防御）。默认 4096×4096，与编码侧 caps 的保守上限一致。
     pub max_resolution: Resolution,
 }
@@ -137,18 +158,22 @@ impl VtDecoderConfig {
     /// 校验配置。非法项以 [`Error::InvalidConfig`](rc_types::Error::InvalidConfig)
     /// 返回，信息含字段与期望值。
     pub fn validate(&self) -> rc_types::Result<()> {
-        if !matches!(self.codec, Codec::H264 | Codec::Hevc) {
-            return Err(rc_types::Error::InvalidConfig(format!(
-                "rc-decode-vt 仅支持 H.264 / HEVC 解码，当前 {:?}",
-                self.codec
-            )));
-        }
-        if self.bitstream_format != BitstreamFormat::AnnexB {
-            return Err(rc_types::Error::InvalidConfig(format!(
-                "rc-decode-vt 只接受 Annex-B 输入（EncoderCaps::bitstream_format 必须为 annexb，当前 {}）；\
-                 VideoToolbox 走 AVCC（长度前缀 + 格式描述），解码端在内部转换——两种封装不能混用（坑 #7）",
-                self.bitstream_format.as_str()
-            )));
+        match (self.codec, self.bitstream_format) {
+            (Codec::H264 | Codec::Hevc, BitstreamFormat::AnnexB)
+            | (Codec::Av1, BitstreamFormat::Obu) => {}
+            (Codec::H264 | Codec::Hevc, other) => {
+                return Err(rc_types::Error::InvalidConfig(format!(
+                    "rc-decode-vt 只接受 Annex-B 输入（EncoderCaps::bitstream_format 必须为 annexb，当前 {}）；\
+                     VideoToolbox 走 AVCC（长度前缀 + 格式描述），解码端在内部转换——两种封装不能混用（坑 #7）",
+                    other.as_str()
+                )));
+            }
+            (Codec::Av1, other) => {
+                return Err(rc_types::Error::InvalidConfig(format!(
+                    "rc-decode-vt AV1 解码只接受 OBU 输入（EncoderCaps::bitstream_format 必须为 obu，当前 {}）",
+                    other.as_str()
+                )));
+            }
         }
         if self.max_resolution.width == 0 || self.max_resolution.height == 0 {
             return Err(rc_types::Error::InvalidConfig(
@@ -207,7 +232,11 @@ mod platform {
         last_clock_advance: Option<Instant>,
         /// 可复用的 NAL 范围暂存区（避免每帧分配 `Vec<(u8, &[u8])>`）。
         nals_scratch: Vec<(u8, Range<usize>)>,
-        /// 可复用的 AVCC/HVCC 拼装暂存区（避免每帧重复分配 `Vec<u8>`）。
+        /// 可复用的 AV1 OBU 范围暂存区（零拷贝切分 OBU 序列，不动 H.264/HEVC 热路径）。
+        obu_scratch: Vec<crate::av1_obu::ObuRange>,
+        /// 当前 AV1 会话 Sequence Header 的 `reduced_still_picture_header` 标志。
+        av1_reduced_still_header: bool,
+        /// 可复用的 AVCC/HVCC/AV1 sample 拼装暂存区（避免每帧重复分配 `Vec<u8>`）。
         avcc_scratch: Vec<u8>,
     }
 
@@ -241,6 +270,8 @@ mod platform {
                 clock_us: 0,
                 last_clock_advance: None,
                 nals_scratch: Vec::with_capacity(8),
+                obu_scratch: Vec::new(),
+                av1_reduced_still_header: false,
                 avcc_scratch: Vec::new(),
             })
         }
@@ -508,10 +539,7 @@ mod platform {
             match self.cfg.codec {
                 Codec::H264 => self.prepare_h264(data, kind, deadline_ts, pipelined),
                 Codec::Hevc => self.prepare_hevc(data, kind, deadline_ts, pipelined),
-                other => Err(Error::InvalidConfig(format!(
-                    "rc-decode-vt 不支持解码器 {:?}",
-                    other
-                ))),
+                Codec::Av1 => self.prepare_av1(data, kind, deadline_ts, pipelined),
             }
         }
 
@@ -759,6 +787,130 @@ mod platform {
 
             Ok(PrepareOutcome::Ready { content_is_idr })
         }
+
+        fn prepare_av1(
+            &mut self,
+            data: &[u8],
+            kind: FrameKind,
+            deadline_ts: Timestamp,
+            pipelined: bool,
+        ) -> Result<PrepareOutcome> {
+            crate::av1_obu::parse_obus_into(data, &mut self.obu_scratch).map_err(|e| {
+                Error::InvalidFrame(format!(
+                    "rc-decode-vt: AV1 OBU 码流非法（配置声明 bitstream_format={}，{} 字节输入）: {e}",
+                    self.cfg.bitstream_format.as_str(),
+                    data.len()
+                ))
+            })?;
+
+            // 若本帧携带 OBU_SEQUENCE_HEADER，先行解析校验（以便准确读取 reduced_still_picture_header）。
+            let parsed_seq = if let Some(seq_idx) = self
+                .obu_scratch
+                .iter()
+                .position(|o| o.obu_type == crate::av1_obu::OBU_SEQUENCE_HEADER)
+            {
+                let payload = &data[self.obu_scratch[seq_idx].payload_range.clone()];
+                let seq = crate::av1_obu::parse_sequence_header(payload)
+                    .map_err(|e| Error::InvalidFrame(e.to_string()))?;
+                Some((seq, seq_idx))
+            } else {
+                None
+            };
+
+            let reduced_still = parsed_seq
+                .as_ref()
+                .map(|(s, _)| s.reduced_still_picture_header)
+                .unwrap_or(self.av1_reduced_still_header);
+            let content_is_idr =
+                crate::av1_obu::classify_frame_is_keyframe(data, &self.obu_scratch, reduced_still)
+                    .map_err(|e| Error::InvalidFrame(e.to_string()))?;
+
+            match (kind, content_is_idr) {
+                (FrameKind::Idr, false) => {
+                    return Err(Error::InvalidFrame(
+                        "声明为 IDR 但 AV1 码流不含 KEY_FRAME OBU".to_string(),
+                    ))
+                }
+                (FrameKind::P, true) => {
+                    return Err(Error::InvalidFrame(
+                        "声明为 P 但 AV1 码流含 KEY_FRAME OBU".to_string(),
+                    ))
+                }
+                _ => {}
+            }
+
+            let est_done_us = self.clock_us.saturating_add(ESTIMATED_DECODE_COST_US);
+            if est_done_us > deadline_ts.0 {
+                return Err(Error::Timeout(Duration::from_micros(u64::from(
+                    est_done_us - deadline_ts.0,
+                ))));
+            }
+
+            let chain_available = self.gate.is_ok() || (pipelined && self.has_idr_in_flight());
+            if !chain_available && !content_is_idr {
+                return Ok(PrepareOutcome::NeedKeyframe);
+            }
+
+            let pending_rebuild = if content_is_idr {
+                match parsed_seq {
+                    Some((seq, seq_idx)) => {
+                        let av1c =
+                            crate::av1_obu::build_av1c(&seq, data, &self.obu_scratch[seq_idx])
+                                .map_err(|e| Error::InvalidFrame(e.to_string()))?;
+                        let needs_rebuild = match self.session_params.as_deref() {
+                            Some(cur) => cur != av1c.as_slice() || self.session.is_none(),
+                            None => true,
+                        };
+                        if needs_rebuild {
+                            if seq.max_frame_width > self.cfg.max_resolution.width
+                                || seq.max_frame_height > self.cfg.max_resolution.height
+                            {
+                                return Err(Error::InvalidFrame(format!(
+                                    "AV1 Sequence Header 声明 {}x{} 超过解码上限 {}x{}",
+                                    seq.max_frame_width,
+                                    seq.max_frame_height,
+                                    self.cfg.max_resolution.width,
+                                    self.cfg.max_resolution.height
+                                )));
+                            }
+                            Some((av1c, seq))
+                        } else {
+                            None
+                        }
+                    }
+                    None if self.session.is_none() => return Ok(PrepareOutcome::NeedKeyframe),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            if pending_rebuild.is_none() && self.session.is_none() {
+                return Ok(PrepareOutcome::NeedKeyframe);
+            }
+
+            // 先按 VideoToolbox AV1 sample 契约剥离 TD/Padding 并校验，确保 replace_session 为最终步骤。
+            crate::av1_obu::build_vt_sample_into(data, &self.obu_scratch, &mut self.avcc_scratch)
+                .map_err(|e| Error::InvalidFrame(e.to_string()))?;
+
+            if let Some((av1c, seq)) = pending_rebuild {
+                let new_session = ffi::DecompressionSession::new_av1(
+                    &av1c,
+                    seq.max_frame_width,
+                    seq.max_frame_height,
+                    self.cfg.max_resolution.width,
+                    self.cfg.max_resolution.height,
+                )
+                .map_err(|e| match e {
+                    Ok(dec_err) => Error::Decoder(dec_err),
+                    Err(frame_err) => Error::InvalidFrame(frame_err),
+                })?;
+                self.av1_reduced_still_header = seq.reduced_still_picture_header;
+                self.replace_session(new_session, av1c, pipelined);
+            }
+
+            Ok(PrepareOutcome::Ready { content_is_idr })
+        }
     }
 }
 
@@ -989,5 +1141,118 @@ mod gates_no_gpu {
             ts2.0, 2_000,
             "重叠帧仅计入非重叠增量 500us（总计 2000us），不得双算为 3300us"
         );
+    }
+
+    #[test]
+    fn av1_config_validation_probe_and_decoder_gates() {
+        // 1) 动态硬件 AV1 探测可安全调用（M1/M2 返回 false，M3/M4/A17 Pro+ 返回 true，绝不崩溃）。
+        let hw_av1 = supports_hardware_av1_decode();
+
+        // 2) 配置校验：AV1 必须匹配 BitstreamFormat::Obu；H264/HEVC 拒绝 Obu。
+        assert!(VtDecoderConfig {
+            codec: Codec::Av1,
+            bitstream_format: BitstreamFormat::Obu,
+            ..VtDecoderConfig::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(VtDecoderConfig {
+            codec: Codec::Av1,
+            bitstream_format: BitstreamFormat::AnnexB,
+            ..VtDecoderConfig::default()
+        }
+        .validate()
+        .is_err());
+        assert!(VtDecoderConfig {
+            codec: Codec::Av1,
+            bitstream_format: BitstreamFormat::Avcc,
+            ..VtDecoderConfig::default()
+        }
+        .validate()
+        .is_err());
+        assert!(VtDecoderConfig {
+            codec: Codec::H264,
+            bitstream_format: BitstreamFormat::Obu,
+            ..VtDecoderConfig::default()
+        }
+        .validate()
+        .is_err());
+
+        // 3) 门禁与无 GPU/不支持硬件行为验证。
+        let mut dec = VtDecoder::new(VtDecoderConfig {
+            codec: Codec::Av1,
+            bitstream_format: BitstreamFormat::Obu,
+            ..VtDecoderConfig::default()
+        })
+        .expect("AV1 OBU 配置合法");
+        assert!(dec.needs_keyframe());
+        assert!(dec.supports_pipelined_decode());
+
+        // 构造单 OBU 帧：OBU_FRAME (type=6, has_size=1 -> header=0x32)
+        // INTER_FRAME: show_existing=0, frame_type=1 -> payload[0] = 0x20
+        let av1_p = vec![0x32, 0x03, 0x20, 0x11, 0x22];
+        // KEY_FRAME（无 Sequence Header）: show_existing=0, frame_type=0 -> payload[0] = 0x10
+        let av1_idr_no_seq = vec![0x32, 0x03, 0x10, 0x33, 0x44];
+
+        // 首个 IDR 之前 P 帧 -> NeedKeyframe
+        assert!(matches!(
+            dec.decode(&av1_p, FrameKind::P, Timestamp(10_000_000)),
+            Ok(DecodeOutput::NeedKeyframe)
+        ));
+        // 无 Sequence Header 的关键帧（无会话可沿用）-> NeedKeyframe
+        assert!(matches!(
+            dec.decode(&av1_idr_no_seq, FrameKind::Idr, Timestamp(10_000_000)),
+            Ok(DecodeOutput::NeedKeyframe)
+        ));
+        // kind 谎报拒绝
+        assert!(matches!(
+            dec.decode(&av1_p, FrameKind::Idr, Timestamp(10_000_000)),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            dec.decode(&av1_idr_no_seq, FrameKind::P, Timestamp(10_000_000)),
+            Err(Error::InvalidFrame(_))
+        ));
+        // 畸形 OBU（forbidden bit = 1）拒绝
+        assert!(matches!(
+            dec.decode(&[0xb2, 0x01, 0x00], FrameKind::Idr, Timestamp(10_000_000)),
+            Err(Error::InvalidFrame(_))
+        ));
+        // deadline 预检超时
+        assert!(matches!(
+            dec.decode(&av1_p, FrameKind::P, Timestamp(1_000)),
+            Err(Error::Timeout(_))
+        ));
+
+        // 带合法 Sequence Header + KEY_FRAME：
+        // - 超出 max_resolution 在进 FFI 前报 InvalidFrame；
+        // - 在不支持 AV1 硬解的机器（如 M1/M2）上明确返回 Error::Decoder 且不崩溃。
+        let seq_payload = crate::av1_obu::tests_helper_seq_payload(1920, 1080, 8, 0, false);
+        let mut idr_with_seq = Vec::new();
+        idr_with_seq.push((crate::av1_obu::OBU_SEQUENCE_HEADER << 3) | 0x02);
+        crate::av1_obu::write_leb128(seq_payload.len() as u32, &mut idr_with_seq);
+        idr_with_seq.extend_from_slice(&seq_payload);
+        idr_with_seq.extend_from_slice(&av1_idr_no_seq);
+
+        let mut small_dec = VtDecoder::new(VtDecoderConfig {
+            codec: Codec::Av1,
+            bitstream_format: BitstreamFormat::Obu,
+            max_resolution: Resolution::new(1280, 720),
+        })
+        .expect("small AV1 config valid");
+        assert!(matches!(
+            small_dec.decode(&idr_with_seq, FrameKind::Idr, Timestamp(10_000_000)),
+            Err(Error::InvalidFrame(ref msg)) if msg.contains("1920x1080")
+        ));
+
+        if !hw_av1 {
+            let err = dec
+                .decode(&idr_with_seq, FrameKind::Idr, Timestamp(10_000_000))
+                .expect_err("不支持 AV1 硬解的设备必须明确返回错误");
+            assert!(
+                matches!(err, Error::Decoder(ref msg) if msg.contains("AV1")),
+                "期望 Error::Decoder(AV1 unsupported)，实际 {err:?}"
+            );
+        }
     }
 }

@@ -16,15 +16,13 @@ rc-audio = { workspace = true }
 rc-session = { workspace = true }
 rc-decode-vt = { path = "../rc-decode-vt" }
 rc-client-core = { workspace = true }
+rc-encode = { workspace = true }
 rc-pipeline = { workspace = true }
 rc-render = { workspace = true }
 rc-decode = { workspace = true }
 rc-capture = { workspace = true }
 rc-types = { workspace = true }
 serde_json = "1"
-
-[dev-dependencies]
-rc-encode = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-core-foundation = { version = "0.3", features = ["CFDictionary", "CFNumber", "CFString"] }

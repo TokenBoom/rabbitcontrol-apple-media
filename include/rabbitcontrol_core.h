@@ -92,7 +92,8 @@ char *rc_session_poll(const char *json);
 /// 返回值由 Rust 侧分配，用后必须 `rc_string_free` 释放。
 char *rc_session_tool_permissions_json(uint64_t session_id);
 
-/// 低频指令:{"session_id": N, "command": {"type":"disconnect"|"set_bitrate"|"stage_rect"|"set_clipboard_enabled"|"set_audio_muted"|"set_stream_params"|"lock_remote_screen", ...}}
+/// 低频指令:{"session_id": N, "command": {"type":"disconnect"|"set_bitrate"|"stage_rect"|"set_clipboard_enabled"|"set_audio_muted"|"set_stream_params"|"set_codec"|"lock_remote_screen", ...}}
+/// 其中 `set_codec` 支持 `"codec": "h264"|"hevc"|"av1"`。
 char *rc_session_command(const char *json);
 
 /// 输入事件:{"session_id": N, "kind":"mouse_move|mouse_button|mouse_wheel|key", ...}
