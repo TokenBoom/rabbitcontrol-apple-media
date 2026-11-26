@@ -328,6 +328,8 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
                     alias: None,
                     device_pubkey: Some(rt.cert_manager.device_pubkey_hex()),
                     allow_remote_assist: None,
+                    app_version: Some(rc_client_core::platform::current_app_version()),
+                    arch: Some(rc_client_core::platform::current_app_arch().to_string()),
                 },
             )
             .map_err(|e| format!("设备绑定: {e}"))?;

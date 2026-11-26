@@ -140,6 +140,8 @@ pub extern "C" fn rc_auth_login(json: *const c_char) -> *mut c_char {
                 hostname: req.hostname,
                 os: req.os,
                 device_pubkey: req.device_pubkey,
+                app_version: Some(rc_client_core::platform::current_app_version()),
+                arch: Some(rc_client_core::platform::current_app_arch().to_string()),
             })
         })
     });
@@ -162,6 +164,8 @@ pub extern "C" fn rc_auth_register(json: *const c_char) -> *mut c_char {
                 hostname: req.hostname,
                 os: req.os,
                 device_pubkey: req.device_pubkey,
+                app_version: Some(rc_client_core::platform::current_app_version()),
+                arch: Some(rc_client_core::platform::current_app_arch().to_string()),
             })
         })
     });
