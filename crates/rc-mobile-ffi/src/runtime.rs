@@ -372,6 +372,7 @@ pub extern "C" fn rc_signal_start(json: *const c_char) -> *mut c_char {
                     token_refresher: Some(token_refresher),
                     device_pubkey: Some(rt.cert_manager.device_pubkey_hex()),
                     allow_remote_assist: false,
+                    allow_remote_control: Some(false),
                     dynamic_lan_discovery: true,
                 },
                 |_| {},
