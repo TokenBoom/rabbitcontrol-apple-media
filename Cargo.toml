@@ -13,13 +13,13 @@ rust-version = "1.75"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
-rc-audio = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.21" }
-rc-session = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.21" }
-rc-input = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.21" }
-rc-capture = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.21" }
-rc-client-core = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.21" }
-rc-decode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.21" }
-rc-encode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.21" }
-rc-pipeline = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.21" }
-rc-render = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.21" }
-rc-types = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.21" }
+rc-audio = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.22" }
+rc-session = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.22" }
+rc-input = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.22" }
+rc-capture = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.22" }
+rc-client-core = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.22" }
+rc-decode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.22" }
+rc-encode = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.22" }
+rc-pipeline = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.22" }
+rc-render = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.22" }
+rc-types = { git = "https://github.com/TokenBoom/rabbitcontrol-core.git", tag = "v0.1.22" }
