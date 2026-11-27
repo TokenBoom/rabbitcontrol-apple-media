@@ -29,6 +29,10 @@ jobs:
       mode: ${{ steps.target.outputs.mode }}
       local_tag: ${{ steps.target.outputs.local_tag }}
       core_tag: ${{ steps.target.outputs.core_tag }}
+      core_commit: ${{ steps.resolved_core.outputs.verified_core_commit }}
+      core_release_id: ${{ steps.target.outputs.core_release_id }}
+      expected_platforms: ${{ steps.target.outputs.expected_platforms }}
+      core_repo: ${{ steps.target.outputs.core_repo }}
     steps:
       - name: Resolve release target
         id: target
@@ -39,6 +43,9 @@ jobs:
           PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
           PAYLOAD_VERSION: ${{ github.event.client_payload.version }}
           PAYLOAD_COMMIT: ${{ github.event.client_payload.commit }}
+          PAYLOAD_RELEASE_ID: ${{ github.event.client_payload.release_id }}
+          PAYLOAD_EXPECTED_PLATFORMS_JSON: ${{ toJSON(github.event.client_payload.expected_platforms) }}
+          PAYLOAD_CORE_REPO: ${{ github.event.client_payload.core_repo }}
         run: |
           set -euo pipefail
           if [ "${EVENT_NAME}" = "repository_dispatch" ]; then
@@ -62,6 +69,55 @@ jobs:
               fi
               CORE_COMMIT="$(printf '%s' "${PAYLOAD_COMMIT}" | tr '[:upper:]' '[:lower:]')"
             fi
+
+            python3 - <<'PY'
+          import json, os, re, sys
+
+          raw_release_id = os.environ.get("PAYLOAD_RELEASE_ID", "").strip()
+          if raw_release_id and not re.fullmatch(r"[1-9][0-9]*", raw_release_id):
+              sys.exit(f"::error::Invalid client_payload.release_id format: {raw_release_id!r}")
+
+          raw_platforms_json = os.environ.get("PAYLOAD_EXPECTED_PLATFORMS_JSON", "").strip()
+          parsed_platforms = json.loads(raw_platforms_json) if raw_platforms_json else None
+          if parsed_platforms is None:
+              platform_items = ["ios", "android"]
+          elif isinstance(parsed_platforms, list):
+              if not parsed_platforms:
+                  platform_items = ["ios", "android"]
+              else:
+                  platform_items = []
+                  for item in parsed_platforms:
+                      if not isinstance(item, str) or not re.fullmatch(r"[a-z0-9_-]+", item):
+                          sys.exit(f"::error::Invalid expected_platforms entry: {item!r}")
+                      if item not in platform_items:
+                          platform_items.append(item)
+          elif isinstance(parsed_platforms, str):
+              parts = [p.strip() for p in parsed_platforms.split(",") if p.strip()]
+              if not parts:
+                  platform_items = ["ios", "android"]
+              else:
+                  platform_items = []
+                  for item in parts:
+                      if not re.fullmatch(r"[a-z0-9_-]+", item):
+                          sys.exit(f"::error::Invalid expected_platforms entry: {item!r}")
+                      if item not in platform_items:
+                          platform_items.append(item)
+          else:
+              sys.exit(f"::error::Invalid client_payload.expected_platforms type: {type(parsed_platforms).__name__}")
+
+          raw_core_repo = os.environ.get("PAYLOAD_CORE_REPO", "").strip() or "TokenBoom/rabbitcontrol-core"
+          if not re.fullmatch(r"TokenBoom/[A-Za-z0-9_.-]+", raw_core_repo) or ".." in raw_core_repo:
+              sys.exit(f"::error::Invalid client_payload.core_repo: {raw_core_repo!r}")
+          repo_name = raw_core_repo.split("/", 1)[1]
+          if repo_name in {".", ".."}:
+              sys.exit(f"::error::Invalid client_payload.core_repo: {raw_core_repo!r}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"core_release_id={raw_release_id}\n")
+              fh.write(f"expected_platforms={','.join(platform_items)}\n")
+              fh.write(f"core_repo={raw_core_repo}\n")
+          PY
+
             echo "mode=core-dispatch" >> "${GITHUB_OUTPUT}"
             echo "core_tag=${CORE_TAG}" >> "${GITHUB_OUTPUT}"
             echo "core_commit=${CORE_COMMIT}" >> "${GITHUB_OUTPUT}"
@@ -108,6 +164,7 @@ jobs:
           fi
 
       - name: Pin rabbitcontrol-core to dispatched tag
+        id: resolved_core
         if: steps.target.outputs.mode == 'core-dispatch'
         env:
           CORE_TAG: ${{ steps.target.outputs.core_tag }}
@@ -207,7 +264,11 @@ jobs:
           commits = {commit for _, _, commit in matched}
           if len(commits) != 1:
               sys.exit(f"ERROR: inconsistent rabbitcontrol-core commits in Cargo.lock: {sorted(commits)}")
-          print(f"Verified {len(matched)} Cargo.lock rabbitcontrol-core packages pinned to {core_tag} ({next(iter(commits))})")
+          verified_commit = next(iter(commits))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"verified_core_commit={verified_commit}\n")
+              fh.write(f"core_commit={verified_commit}\n")
+          print(f"Verified {len(matched)} Cargo.lock rabbitcontrol-core packages pinned to {core_tag} ({verified_commit})")
           PY
 
       - name: Build & package xcframework
@@ -223,6 +284,102 @@ jobs:
           shasum -a 256 -c SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Generate platform-ios.json
+        if: steps.target.outputs.mode == 'core-dispatch'
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          CORE_TAG: ${{ steps.target.outputs.core_tag }}
+          VERIFIED_CORE_COMMIT: ${{ steps.resolved_core.outputs.verified_core_commit }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, sys
+
+          archive_name = "RabbitControlCore.xcframework.tar.gz"
+          archive_path = pathlib.Path("build") / archive_name
+          sums_path = pathlib.Path("build/SHA256SUMS.txt")
+          cargo_toml_path = pathlib.Path("Cargo.toml")
+          manifest_path = pathlib.Path("build/platform-ios.json")
+
+          if not archive_path.is_file():
+              sys.exit(f"ERROR: missing archive {archive_path}")
+          if not sums_path.is_file():
+              sys.exit(f"ERROR: missing checksum file {sums_path}")
+
+          sums_sha = None
+          for raw in sums_path.read_text(encoding="utf-8").splitlines():
+              line = raw.strip()
+              if not line:
+                  continue
+              m = re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(.+)", line)
+              if not m:
+                  sys.exit(f"ERROR: malformed SHA256SUMS.txt line: {raw!r}")
+              if m.group(2).strip() == archive_name:
+                  sums_sha = m.group(1).lower()
+                  break
+          if not sums_sha:
+              sys.exit(f"ERROR: {archive_name} not found in {sums_path}")
+
+          h = hashlib.sha256()
+          with archive_path.open("rb") as fh:
+              for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                  h.update(chunk)
+          actual_sha = h.hexdigest()
+          if actual_sha != sums_sha:
+              sys.exit(f"ERROR: sha256 mismatch for {archive_name}: {actual_sha} != {sums_sha}")
+
+          actual_size = archive_path.stat().st_size
+          if actual_size <= 0:
+              sys.exit(f"ERROR: archive size must be positive, got {actual_size}")
+
+          cargo_text = cargo_toml_path.read_text(encoding="utf-8")
+          try:
+              import tomllib
+              version = tomllib.loads(cargo_text)["workspace"]["package"]["version"]
+          except ModuleNotFoundError:
+              in_ws_pkg = False
+              version = None
+              for raw in cargo_text.splitlines():
+                  s = raw.strip()
+                  if s.startswith("["):
+                      in_ws_pkg = (s == "[workspace.package]")
+                  elif in_ws_pkg:
+                      m = re.match(r'^version\s*=\s*"([^"]+)"', s)
+                      if m:
+                          version = m.group(1)
+                          break
+              if not version:
+                  sys.exit("ERROR: could not find workspace.package.version in Cargo.toml")
+
+          core_tag = os.environ["CORE_TAG"].strip()
+          core_commit = os.environ["VERIFIED_CORE_COMMIT"].strip().lower()
+          if not core_tag:
+              sys.exit("ERROR: CORE_TAG is empty")
+          if not re.fullmatch(r"[0-9a-f]{40}", core_commit):
+              sys.exit(f"ERROR: invalid VERIFIED_CORE_COMMIT: {core_commit!r}")
+
+          manifest = {
+              "platform": "ios",
+              "repo": os.environ["GITHUB_REPOSITORY"],
+              "version": version,
+              "commit": os.environ["GITHUB_SHA"],
+              "coreTag": core_tag,
+              "coreCommit": core_commit,
+              "artifacts": [
+                  {
+                      "name": archive_name,
+                      "sha256": actual_sha,
+                      "size": actual_size,
+                      "arch": "ios-arm64+ios-arm64_x86_64-simulator",
+                      "format": "xcframework.tar.gz",
+                  }
+              ],
+          }
+          manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          print(f"Wrote {manifest_path}: sha256={actual_sha} size={actual_size} version={version}")
+          PY
+
       - name: Upload xcframework artifact
         uses: actions/upload-artifact@v7
         with:
@@ -230,6 +387,15 @@ jobs:
           path: |
             build/RabbitControlCore.xcframework.tar.gz
             build/SHA256SUMS.txt
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload platform-ios.json artifact
+        if: steps.target.outputs.mode == 'core-dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: platform-ios-manifest
+          path: build/platform-ios.json
           retention-days: 1
           if-no-files-found: error
 
@@ -288,27 +454,243 @@ jobs:
           name: xcframework-archive
           path: build
 
-      - name: Verify archive checksums
-        run: |
-          set -euo pipefail
-          cd build
-          sha256sum -c SHA256SUMS.txt
+      - name: Download platform-ios.json artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: platform-ios-manifest
+          path: build
 
-      - name: Upload assets to TokenBoom/rabbitcontrol-core release
+      - name: Verify archive checksums and platform-ios.json
         env:
-          GH_TOKEN: ${{ secrets.CORE_RELEASE_TOKEN }}
           CORE_TAG: ${{ needs.build.outputs.core_tag }}
-          CORE_REPO: "TokenBoom/rabbitcontrol-core"
+          CORE_COMMIT: ${{ needs.build.outputs.core_commit }}
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "::warning::CORE_RELEASE_TOKEN is not configured; skipping upload of RabbitControlCore.xcframework.tar.gz and checksum to ${CORE_REPO} release ${CORE_TAG}."
-            exit 0
+          (
+            cd build
+            sha256sum -c SHA256SUMS.txt
+          )
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, sys
+
+          archive_name = "RabbitControlCore.xcframework.tar.gz"
+          archive_path = pathlib.Path("build") / archive_name
+          sums_path = pathlib.Path("build/SHA256SUMS.txt")
+          sha_sidecar_path = pathlib.Path(f"build/{archive_name}.sha256")
+          manifest_path = pathlib.Path("build/platform-ios.json")
+
+          h = hashlib.sha256()
+          with archive_path.open("rb") as fh:
+              for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                  h.update(chunk)
+          actual_sha = h.hexdigest()
+          actual_size = archive_path.stat().st_size
+
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          if manifest.get("platform") != "ios":
+              sys.exit(f"ERROR: unexpected platform in platform-ios.json: {manifest.get('platform')!r}")
+          if manifest.get("coreTag") != os.environ["CORE_TAG"]:
+              sys.exit(f"ERROR: coreTag mismatch in platform-ios.json: {manifest.get('coreTag')!r} != {os.environ['CORE_TAG']!r}")
+          if manifest.get("coreCommit") != os.environ["CORE_COMMIT"]:
+              sys.exit(f"ERROR: coreCommit mismatch in platform-ios.json: {manifest.get('coreCommit')!r} != {os.environ['CORE_COMMIT']!r}")
+
+          artifacts = manifest.get("artifacts")
+          if not isinstance(artifacts, list) or len(artifacts) != 1:
+              sys.exit(f"ERROR: expected 1 artifact entry in platform-ios.json, got {artifacts!r}")
+          entry = artifacts[0]
+          if entry.get("name") != archive_name:
+              sys.exit(f"ERROR: unexpected artifact name: {entry.get('name')!r}")
+          if entry.get("sha256") != actual_sha:
+              sys.exit(f"ERROR: platform-ios.json sha256 mismatch: {entry.get('sha256')!r} != {actual_sha!r}")
+          if entry.get("size") != actual_size:
+              sys.exit(f"ERROR: platform-ios.json size mismatch: {entry.get('size')!r} != {actual_size!r}")
+
+          matched_sum = None
+          for raw in sums_path.read_text(encoding="utf-8").splitlines():
+              m = re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(.+)", raw.strip())
+              if m and m.group(2).strip() == archive_name:
+                  matched_sum = m.group(1).lower()
+                  break
+          if matched_sum != actual_sha:
+              sys.exit(f"ERROR: SHA256SUMS.txt sha256 mismatch: {matched_sum!r} != {actual_sha!r}")
+
+          shutil.copyfile(sums_path, sha_sidecar_path)
+          print(f"Verified platform-ios.json and prepared {sha_sidecar_path} (sha256={actual_sha}, size={actual_size})")
+          PY
+
+      - name: Generate GitHub App core-release token
+        id: app-token
+        if: ${{ secrets.RELEASE_APP_ID != '' && secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: TokenBoom
+          repositories: rabbitcontrol-core
+
+      - name: Upload assets to core release and notify readiness
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          LEGACY_TOKEN: ${{ secrets.CORE_RELEASE_TOKEN }}
+          CORE_REPO: ${{ needs.build.outputs.core_repo }}
+          CORE_TAG: ${{ needs.build.outputs.core_tag }}
+          CORE_COMMIT: ${{ needs.build.outputs.core_commit }}
+          CORE_RELEASE_ID: ${{ needs.build.outputs.core_release_id }}
+          EXPECTED_PLATFORMS: ${{ needs.build.outputs.expected_platforms }}
+        run: |
+          set -euo pipefail
+          TOKEN="${APP_TOKEN:-${LEGACY_TOKEN}}"
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::Neither GitHub App credentials (RELEASE_APP_ID/RELEASE_APP_PRIVATE_KEY) nor CORE_RELEASE_TOKEN are configured."
+            exit 1
           fi
-          cp build/SHA256SUMS.txt build/RabbitControlCore.xcframework.tar.gz.sha256
-          gh release view "${CORE_TAG}" --repo "${CORE_REPO}" >/dev/null
-          gh release upload "${CORE_TAG}" \
-            --repo "${CORE_REPO}" \
-            build/RabbitControlCore.xcframework.tar.gz \
-            build/RabbitControlCore.xcframework.tar.gz.sha256 \
-            --clobber
+          export GH_API_TOKEN="${TOKEN}"
+          unset APP_TOKEN LEGACY_TOKEN TOKEN
+
+          python3 - <<'PY'
+          import json, os, pathlib, sys, urllib.error, urllib.parse, urllib.request
+
+          token = os.environ["GH_API_TOKEN"]
+          core_repo = os.environ["CORE_REPO"].strip()
+          core_tag = os.environ["CORE_TAG"].strip()
+          core_commit = os.environ["CORE_COMMIT"].strip()
+          core_release_id = os.environ.get("CORE_RELEASE_ID", "").strip()
+          expected_platforms_raw = os.environ.get("EXPECTED_PLATFORMS", "").strip()
+          expected_list = [p for p in expected_platforms_raw.split(",") if p]
+
+          api_base = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+          base_headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "rabbitcontrol-apple-media-release",
+          }
+
+          def api_request(method, url, body=None, extra_headers=None):
+              headers = dict(base_headers)
+              if extra_headers:
+                  headers.update(extra_headers)
+              req = urllib.request.Request(url, data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=120) as resp:
+                      return resp.status, resp.read()
+              except urllib.error.HTTPError as exc:
+                  detail = exc.read().decode("utf-8", errors="replace")
+                  sys.exit(f"ERROR: GitHub API {method} {url} returned HTTP {exc.code}: {detail}")
+
+          # 1. Draft-safe release resolution
+          release = None
+          if core_release_id:
+              status, raw = api_request("GET", f"{api_base}/repos/{core_repo}/releases/{core_release_id}")
+              if status != 200:
+                  sys.exit(f"ERROR: unexpected HTTP {status} resolving release {core_release_id}")
+              release = json.loads(raw.decode("utf-8"))
+              if release.get("tag_name") != core_tag:
+                  sys.exit(
+                      f"ERROR: release {core_release_id} tag_name={release.get('tag_name')!r} "
+                      f"does not match CORE_TAG={core_tag!r}"
+                  )
+          else:
+              page = 1
+              while True:
+                  status, raw = api_request(
+                      "GET",
+                      f"{api_base}/repos/{core_repo}/releases?per_page=100&page={page}",
+                  )
+                  if status != 200:
+                      sys.exit(f"ERROR: unexpected HTTP {status} listing releases page {page}")
+                  items = json.loads(raw.decode("utf-8"))
+                  if not items:
+                      break
+                  for item in items:
+                      if item.get("tag_name") == core_tag:
+                          release = item
+                          break
+                  if release is not None or len(items) < 100:
+                      break
+                  page += 1
+              if release is None:
+                  sys.exit(f"ERROR: release for tag {core_tag!r} not found in {core_repo} (checked draft and published releases)")
+
+          resolved_release_id = release["id"]
+          upload_url_tmpl = release.get("upload_url", "")
+          upload_base = upload_url_tmpl.split("{", 1)[0] if upload_url_tmpl else (
+              f"https://uploads.github.com/repos/{core_repo}/releases/{resolved_release_id}/assets"
+          )
+
+          # 2. Fetch existing release assets (paginated) for idempotent replacement
+          existing_assets = {}
+          asset_page = 1
+          while True:
+              status, raw = api_request(
+                  "GET",
+                  f"{api_base}/repos/{core_repo}/releases/{resolved_release_id}/assets?per_page=100&page={asset_page}",
+              )
+              if status != 200:
+                  sys.exit(f"ERROR: unexpected HTTP {status} listing assets for release {resolved_release_id}")
+              assets = json.loads(raw.decode("utf-8"))
+              if not assets:
+                  break
+              for asset in assets:
+                  existing_assets[asset["name"]] = asset["id"]
+              if len(assets) < 100:
+                  break
+              asset_page += 1
+
+          # 3. Upload ONLY the 3 required assets
+          upload_specs = [
+              ("RabbitControlCore.xcframework.tar.gz", pathlib.Path("build/RabbitControlCore.xcframework.tar.gz"), "application/gzip"),
+              ("RabbitControlCore.xcframework.tar.gz.sha256", pathlib.Path("build/RabbitControlCore.xcframework.tar.gz.sha256"), "text/plain"),
+              ("platform-ios.json", pathlib.Path("build/platform-ios.json"), "application/json"),
+          ]
+
+          for asset_name, asset_path, content_type in upload_specs:
+              if not asset_path.is_file():
+                  sys.exit(f"ERROR: missing upload asset {asset_path}")
+              if asset_name in existing_assets:
+                  old_id = existing_assets[asset_name]
+                  del_status, _ = api_request(
+                      "DELETE",
+                      f"{api_base}/repos/{core_repo}/releases/assets/{old_id}",
+                  )
+                  if del_status != 204:
+                      sys.exit(f"ERROR: failed deleting existing asset {asset_name} (id={old_id}), status={del_status}")
+
+              data = asset_path.read_bytes()
+              upload_url = f"{upload_base}?name={urllib.parse.quote(asset_name)}"
+              up_status, _ = api_request(
+                  "POST",
+                  upload_url,
+                  body=data,
+                  extra_headers={
+                      "Content-Type": content_type,
+                      "Content-Length": str(len(data)),
+                  },
+              )
+              if up_status not in (200, 201):
+                  sys.exit(f"ERROR: failed uploading asset {asset_name}, status={up_status}")
+              print(f"Uploaded {asset_name} ({len(data)} bytes) to {core_repo} release {resolved_release_id}")
+
+          # 4. Dispatch rabbitcontrol-core-platform-ready
+          dispatch_payload = json.dumps(
+              {
+                  "event_type": "rabbitcontrol-core-platform-ready",
+                  "client_payload": {
+                      "tag": core_tag,
+                      "platform": "ios",
+                      "commit": core_commit,
+                      "release_id": resolved_release_id,
+                      "expected_platforms": expected_list,
+                  },
+              }
+          ).encode("utf-8")
+          disp_status, _ = api_request(
+              "POST",
+              f"{api_base}/repos/{core_repo}/dispatches",
+              body=dispatch_payload,
+              extra_headers={"Content-Type": "application/json"},
+          )
+          if disp_status != 204:
+              sys.exit(f"ERROR: expected HTTP 204 from repository_dispatch, got {disp_status}")
+          print(f"Dispatched rabbitcontrol-core-platform-ready to {core_repo} for {core_tag} (release_id={resolved_release_id})")
+          PY
