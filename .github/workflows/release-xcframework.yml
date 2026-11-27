@@ -518,9 +518,22 @@ jobs:
           print(f"Verified platform-ios.json and prepared {sha_sidecar_path} (sha256={actual_sha}, size={actual_size})")
           PY
 
+      - name: Check GitHub App credentials
+        id: app-cfg
+        env:
+          HAS_APP_ID: ${{ secrets.RELEASE_APP_ID != '' }}
+          HAS_APP_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [ "${HAS_APP_ID}" = "true" ] && [ "${HAS_APP_KEY}" = "true" ]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Generate GitHub App core-release token
         id: app-token
-        if: ${{ secrets.RELEASE_APP_ID != '' && secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+        if: steps.app-cfg.outputs.enabled == 'true'
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
